@@ -147,7 +147,8 @@ dnL4 = ibLocked ? ibLow - ibRange * m4 : na
 dnL5 = ibLocked ? ibLow - ibRange * m5 : na
 
 // -----------------------------------------------------------------------------
-// Day classification (single break / double break)
+// Day classification state (break tracking runs AFTER entry arming below so
+// a first-post-IB bar that already exceeds the IB can still arm the entry)
 // -----------------------------------------------------------------------------
 var bool brokeAbove  = false
 var bool brokeBelow  = false
@@ -157,14 +158,6 @@ if rthStart
     brokeAbove  := false
     brokeBelow  := false
     doubleBreak := false
-
-if ibLocked and inRTH
-    if high > ibHigh
-        brokeAbove := true
-    if low  < ibLow
-        brokeBelow := true
-    if brokeAbove and brokeBelow
-        doubleBreak := true
 
 // -----------------------------------------------------------------------------
 // Stop loss anchors
@@ -209,6 +202,24 @@ if strategy.position_size > 0
     strategy.cancel("S")
 if strategy.position_size < 0
     strategy.cancel("L")
+
+// -----------------------------------------------------------------------------
+// Break tracking (runs AFTER entry arming so the first post-IB bar can still
+// arm its entry even when its own high/low already crosses the IB level)
+// -----------------------------------------------------------------------------
+if ibLocked and inRTH
+    if high > ibHigh
+        brokeAbove := true
+    if low < ibLow
+        brokeBelow := true
+    if brokeAbove and brokeBelow
+        doubleBreak := true
+
+// Once the day flips to a double break, kill any still-pending stop entries
+// so they cannot fire on a later bar.
+if doubleBreak
+    strategy.cancel("L")
+    strategy.cancel("S")
 
 // -----------------------------------------------------------------------------
 // Scaled exits
