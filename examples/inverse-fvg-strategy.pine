@@ -49,7 +49,7 @@ strategy(
 grpDetect   = "FVG Detection"
 minGapATR   = input.float(0.25,  "Min Gap Size (x ATR)",          minval = 0.0,  step = 0.05, group = grpDetect,
                           tooltip = "Minimum FVG height expressed in ATR units. Filters out tiny, noisy gaps.")
-maxFVGs     = input.int  (20,    "Max Tracked FVGs",              minval = 1,    maxval = 100, group = grpDetect,
+maxFVGs     = input.int  (5,     "Max Tracked FVGs",              minval = 1,    maxval = 30, group = grpDetect,
                           tooltip = "Maximum number of unfilled FVGs kept in memory. Oldest are dropped first.")
 useMitigCls = input.bool (true,  "Invalidate on Close Only",                      group = grpDetect,
                           tooltip = "If enabled, an FVG is only invalidated when a candle CLOSES through it (iFVG). Otherwise a wick-through counts.")
@@ -69,10 +69,20 @@ tradeSess   = input.session("0930-1600", "Trading Session",                     
 grpViz      = "Visualization"
 showFVG     = input.bool (true,  "Show Unfilled FVGs",                             group = grpViz)
 showIFVG    = input.bool (true,  "Show Inverse FVGs",                              group = grpViz)
-bullCol     = input.color(color.new(color.teal,   80), "Bullish FVG Color",        group = grpViz)
-bearCol     = input.color(color.new(color.maroon, 80), "Bearish FVG Color",        group = grpViz)
-iBullCol    = input.color(color.new(color.lime,   70), "Bullish iFVG Color",       group = grpViz)
-iBearCol    = input.color(color.new(color.red,    70), "Bearish iFVG Color",       group = grpViz)
+maxIFVGs    = input.int  (3,     "Max Visible iFVGs",             minval = 1,    maxval = 20, group = grpViz,
+                          tooltip = "Keeps only the N most recent iFVG boxes on the chart; older ones are auto-deleted.")
+zoneLen     = input.int  (40,    "Zone Length (bars)",            minval = 5,    maxval = 500, group = grpViz,
+                          tooltip = "How far right (in bars) a fixed-length zone extends from its origin.")
+extendUnhit = input.bool (true,  "Extend Unfilled FVGs",                           group = grpViz,
+                          tooltip = "When on, unfilled FVGs stretch to the current bar. When off, they use the fixed Zone Length.")
+onlyLatest  = input.bool (true,  "Freeze Stale FVG Edges",                         group = grpViz,
+                          tooltip = "When a newer FVG forms in the same direction, freeze the older one's right edge so only the newest extends forward.")
+labelZones  = input.bool (false, "Label Zones",                                    group = grpViz)
+bullCol     = input.color(color.new(color.teal,   85), "Bullish FVG Color",        group = grpViz)
+bearCol     = input.color(color.new(color.maroon, 85), "Bearish FVG Color",        group = grpViz)
+iBullCol    = input.color(color.new(color.lime,   80), "Bullish iFVG Color",       group = grpViz)
+iBearCol    = input.color(color.new(color.red,    80), "Bearish iFVG Color",       group = grpViz)
+labelCol    = input.color(color.new(color.gray,   20), "Label Color",              group = grpViz)
 
 // -----------------------------------------------------------------------------
 // Utilities
@@ -90,11 +100,12 @@ inSession = not useSession or not na(time(timeframe.period, tradeSess))
 //   dirArr        - +1 bullish FVG, -1 bearish FVG
 //   boxArr        - handle to the box drawing (na if showFVG is false)
 // -----------------------------------------------------------------------------
-var array<float> topArr = array.new<float>()
-var array<float> botArr = array.new<float>()
-var array<int>   barArr = array.new<int>()
-var array<int>   dirArr = array.new<int>()
-var array<box>   boxArr = array.new<box>()
+var array<float> topArr  = array.new<float>()
+var array<float> botArr  = array.new<float>()
+var array<int>   barArr  = array.new<int>()
+var array<int>   dirArr  = array.new<int>()
+var array<box>   boxArr  = array.new<box>()
+var array<box>   iBoxArr = array.new<box>()    // iFVG boxes tracked for pruning
 
 // Drop the oldest FVG when the buffer exceeds maxFVGs.
 pruneOldest() =>
@@ -106,6 +117,26 @@ pruneOldest() =>
         array.shift(botArr)
         array.shift(barArr)
         array.shift(dirArr)
+
+// Keep only the N most recent iFVG boxes on the chart.
+pruneIFVGBoxes() =>
+    while array.size(iBoxArr) > maxIFVGs
+        b = array.shift(iBoxArr)
+        if not na(b)
+            box.delete(b)
+
+// Freeze older same-direction FVG boxes so only the newest extends to the
+// right. Called right before a new FVG is registered.
+freezeSameDir(int newDir) =>
+    if onlyLatest and extendUnhit
+        sz = array.size(dirArr)
+        if sz > 0
+            for j = 0 to sz - 1
+                if array.get(dirArr, j) == newDir
+                    pb = array.get(boxArr, j)
+                    if not na(pb)
+                        box.set_extend(pb, extend.none)
+                        box.set_right(pb, bar_index)
 
 // Remove the FVG at index i, deleting its box and returning its direction.
 removeFVG(int i) =>
@@ -127,22 +158,28 @@ removeFVG(int i) =>
 bullFVG = low > high[2] and (low - high[2]) >= minGapATR * atrVal
 bearFVG = high < low[2] and (low[2] - high) >= minGapATR * atrVal
 
+// Right-edge and extend mode for unfilled FVG boxes.
+fvgExtend = extendUnhit ? extend.right : extend.none
+fvgRight  = extendUnhit ? bar_index    : bar_index + zoneLen
+
 if barstate.isconfirmed
     if bullFVG
+        freezeSameDir(1)
         array.push(topArr, low)              // gap top
         array.push(botArr, high[2])          // gap bottom
         array.push(barArr, bar_index - 2)
         array.push(dirArr, 1)
-        bx = showFVG ? box.new(bar_index - 2, low, bar_index, high[2], border_color = color.new(color.teal, 40), bgcolor = bullCol, extend = extend.right) : na
+        bx = showFVG ? box.new(bar_index - 2, low, fvgRight, high[2], border_color = color.new(color.teal, 55), bgcolor = bullCol, extend = fvgExtend, text = labelZones ? "FVG" : "", text_size = size.tiny, text_color = labelCol, text_halign = text.align_left, text_valign = text.align_center) : na
         array.push(boxArr, bx)
         pruneOldest()
 
     if bearFVG
+        freezeSameDir(-1)
         array.push(topArr, low[2])           // gap top
         array.push(botArr, high)             // gap bottom
         array.push(barArr, bar_index - 2)
         array.push(dirArr, -1)
-        bx = showFVG ? box.new(bar_index - 2, low[2], bar_index, high, border_color = color.new(color.maroon, 40), bgcolor = bearCol, extend = extend.right) : na
+        bx = showFVG ? box.new(bar_index - 2, low[2], fvgRight, high, border_color = color.new(color.maroon, 55), bgcolor = bearCol, extend = fvgExtend, text = labelZones ? "FVG" : "", text_size = size.tiny, text_color = labelCol, text_halign = text.align_left, text_valign = text.align_center) : na
         array.push(boxArr, bx)
         pruneOldest()
 
@@ -168,7 +205,6 @@ if barstate.isconfirmed and array.size(topArr) > 0
         top = array.get(topArr, i)
         bot = array.get(botArr, i)
         dir = array.get(dirArr, i)
-        bar = array.get(barArr, i)
 
         violatedBull = dir ==  1 and (useMitigCls ? close < bot : low  < bot)
         violatedBear = dir == -1 and (useMitigCls ? close > top : high > top)
@@ -180,7 +216,9 @@ if barstate.isconfirmed and array.size(topArr) > 0
             iFVGTop   := top
             iFVGBot   := bot
             if showIFVG
-                bxIBear = box.new(bar, top, bar_index, bot, border_color = color.new(color.red, 30), bgcolor = iBearCol, extend = extend.right)
+                bxIBear = box.new(bar_index, top, bar_index + zoneLen, bot, border_color = color.new(color.red, 40), bgcolor = iBearCol, extend = extend.none, text = labelZones ? "iFVG" : "", text_size = size.tiny, text_color = labelCol, text_halign = text.align_left, text_valign = text.align_center)
+                array.push(iBoxArr, bxIBear)
+                pruneIFVGBoxes()
         else if violatedBear
             // Bearish FVG invalidated -> bullish iFVG (long signal).
             removeFVG(i)
@@ -188,7 +226,9 @@ if barstate.isconfirmed and array.size(topArr) > 0
             iFVGTop  := top
             iFVGBot  := bot
             if showIFVG
-                bxIBull = box.new(bar, top, bar_index, bot, border_color = color.new(color.green, 30), bgcolor = iBullCol, extend = extend.right)
+                bxIBull = box.new(bar_index, top, bar_index + zoneLen, bot, border_color = color.new(color.green, 40), bgcolor = iBullCol, extend = extend.none, text = labelZones ? "iFVG" : "", text_size = size.tiny, text_color = labelCol, text_halign = text.align_left, text_valign = text.align_center)
+                array.push(iBoxArr, bxIBull)
+                pruneIFVGBoxes()
 
 // -----------------------------------------------------------------------------
 // Entries & exits
