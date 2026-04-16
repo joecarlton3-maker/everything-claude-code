@@ -133,10 +133,7 @@ if barstate.isconfirmed
         array.push(botArr, high[2])          // gap bottom
         array.push(barArr, bar_index - 2)
         array.push(dirArr, 1)
-        bx = showFVG ? box.new(bar_index - 2, low, bar_index, high[2],
-                               border_color = color.new(color.teal, 40),
-                               bgcolor      = bullCol,
-                               extend       = extend.right) : na
+        bx = showFVG ? box.new(bar_index - 2, low, bar_index, high[2], border_color = color.new(color.teal, 40), bgcolor = bullCol, extend = extend.right) : na
         array.push(boxArr, bx)
         pruneOldest()
 
@@ -145,10 +142,7 @@ if barstate.isconfirmed
         array.push(botArr, high)             // gap bottom
         array.push(barArr, bar_index - 2)
         array.push(dirArr, -1)
-        bx = showFVG ? box.new(bar_index - 2, low[2], bar_index, high,
-                               border_color = color.new(color.maroon, 40),
-                               bgcolor      = bearCol,
-                               extend       = extend.right) : na
+        bx = showFVG ? box.new(bar_index - 2, low[2], bar_index, high, border_color = color.new(color.maroon, 40), bgcolor = bearCol, extend = extend.right) : na
         array.push(boxArr, bx)
         pruneOldest()
 
@@ -186,10 +180,7 @@ if barstate.isconfirmed and array.size(topArr) > 0
             iFVGTop   := top
             iFVGBot   := bot
             if showIFVG
-                box.new(bar, top, bar_index, bot,
-                        border_color = color.new(color.red, 30),
-                        bgcolor      = iBearCol,
-                        extend       = extend.right)
+                bxIBear = box.new(bar, top, bar_index, bot, border_color = color.new(color.red, 30), bgcolor = iBearCol, extend = extend.right)
         else if violatedBear
             // Bearish FVG invalidated -> bullish iFVG (long signal).
             removeFVG(i)
@@ -197,10 +188,7 @@ if barstate.isconfirmed and array.size(topArr) > 0
             iFVGTop  := top
             iFVGBot  := bot
             if showIFVG
-                box.new(bar, top, bar_index, bot,
-                        border_color = color.new(color.green, 30),
-                        bgcolor      = iBullCol,
-                        extend       = extend.right)
+                bxIBull = box.new(bar, top, bar_index, bot, border_color = color.new(color.green, 30), bgcolor = iBullCol, extend = extend.right)
 
 // -----------------------------------------------------------------------------
 // Entries & exits
@@ -215,13 +203,11 @@ shortTP    = close - slMult * atrVal * rrRatio
 
 if longSignal
     strategy.entry("Long", strategy.long, comment = "iFVG Long")
-    strategy.exit ("Long TP/SL", from_entry = "Long", stop = longStop, limit = longTP,
-                   comment_loss = "SL", comment_profit = "TP")
+    strategy.exit("Long TP/SL", from_entry = "Long", stop = longStop, limit = longTP, comment_loss = "SL", comment_profit = "TP")
 
 if shortSignal
     strategy.entry("Short", strategy.short, comment = "iFVG Short")
-    strategy.exit ("Short TP/SL", from_entry = "Short", stop = shortStop, limit = shortTP,
-                   comment_loss = "SL", comment_profit = "TP")
+    strategy.exit("Short TP/SL", from_entry = "Short", stop = shortStop, limit = shortTP, comment_loss = "SL", comment_profit = "TP")
 
 // -----------------------------------------------------------------------------
 // Plots & alerts
