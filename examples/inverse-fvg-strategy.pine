@@ -1,0 +1,237 @@
+// =============================================================================
+// Inverse Fair Value Gap (iFVG) Strategy
+// =============================================================================
+// Assumptions:
+//   - FVG is defined by a 3-bar pattern:
+//       Bullish FVG: low[0] > high[2]  (imbalance up between bars n-2 and n)
+//       Bearish FVG: high[0] < low[2]  (imbalance down between bars n-2 and n)
+//   - An Inverse FVG (iFVG) is formed when a valid, unfilled FVG is
+//     "violated" by a candle closing through it. The invalidation flips the
+//     zone's bias: a bullish FVG that is closed below becomes a bearish iFVG
+//     (short signal); a bearish FVG that is closed above becomes a bullish
+//     iFVG (long signal).
+//   - Only the most recent N unfilled FVGs are tracked for efficiency.
+//   - Risk management uses an ATR-based stop and a configurable R:R target.
+//
+// Inputs:
+//   - Detection sensitivity (minimum gap size in ATR units)
+//   - Max FVGs to track
+//   - Trading session filter
+//   - ATR length, stop-loss multiplier, take-profit R:R
+//   - Visualization toggles
+//
+// Outputs:
+//   - Long/Short entries on iFVG formations
+//   - ATR-based stop-loss and R:R-based take-profit exits
+//   - FVG and iFVG zones plotted as boxes
+//   - Alerts for every entry, stop, and target
+// =============================================================================
+
+//@version=5
+strategy(
+     title                = "Inverse FVG Strategy",
+     shorttitle           = "iFVG",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 10,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.04,
+     slippage             = 2,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     max_boxes_count      = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+grpDetect   = "FVG Detection"
+minGapATR   = input.float(0.25,  "Min Gap Size (x ATR)",          minval = 0.0,  step = 0.05, group = grpDetect,
+                          tooltip = "Minimum FVG height expressed in ATR units. Filters out tiny, noisy gaps.")
+maxFVGs     = input.int  (20,    "Max Tracked FVGs",              minval = 1,    maxval = 100, group = grpDetect,
+                          tooltip = "Maximum number of unfilled FVGs kept in memory. Oldest are dropped first.")
+useMitigCls = input.bool (true,  "Invalidate on Close Only",                      group = grpDetect,
+                          tooltip = "If enabled, an FVG is only invalidated when a candle CLOSES through it (iFVG). Otherwise a wick-through counts.")
+
+grpRisk     = "Risk Management"
+atrLen      = input.int  (14,    "ATR Length",                    minval = 1,    group = grpRisk)
+slMult      = input.float(1.5,   "Stop Loss (x ATR)",             minval = 0.1,  step = 0.1, group = grpRisk)
+rrRatio     = input.float(2.0,   "Take Profit (R:R)",             minval = 0.1,  step = 0.1, group = grpRisk,
+                          tooltip = "Reward-to-risk ratio. TP distance = stop distance x R:R.")
+allowLongs  = input.bool (true,  "Allow Long Trades",                              group = grpRisk)
+allowShorts = input.bool (true,  "Allow Short Trades",                             group = grpRisk)
+
+grpSess     = "Session Filter"
+useSession  = input.bool (false, "Limit to Session",                               group = grpSess)
+tradeSess   = input.session("0930-1600", "Trading Session",                        group = grpSess)
+
+grpViz      = "Visualization"
+showFVG     = input.bool (true,  "Show Unfilled FVGs",                             group = grpViz)
+showIFVG    = input.bool (true,  "Show Inverse FVGs",                              group = grpViz)
+bullCol     = input.color(color.new(color.teal,   80), "Bullish FVG Color",        group = grpViz)
+bearCol     = input.color(color.new(color.maroon, 80), "Bearish FVG Color",        group = grpViz)
+iBullCol    = input.color(color.new(color.lime,   70), "Bullish iFVG Color",       group = grpViz)
+iBearCol    = input.color(color.new(color.red,    70), "Bearish iFVG Color",       group = grpViz)
+
+// -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
+atrVal = ta.atr(atrLen)
+
+// Session gate: returns true when trading is allowed on the current bar.
+inSession = not useSession or not na(time(timeframe.period, tradeSess))
+
+// -----------------------------------------------------------------------------
+// FVG state, stored in parallel arrays for O(1) indexed access.
+// Each "slot" represents one tracked FVG:
+//   topArr/botArr - price bounds of the gap
+//   barArr        - bar_index where the gap formed (for box drawing)
+//   dirArr        - +1 bullish FVG, -1 bearish FVG
+//   boxArr        - handle to the box drawing (na if showFVG is false)
+// -----------------------------------------------------------------------------
+var array<float> topArr = array.new<float>()
+var array<float> botArr = array.new<float>()
+var array<int>   barArr = array.new<int>()
+var array<int>   dirArr = array.new<int>()
+var array<box>   boxArr = array.new<box>()
+
+// Drop the oldest FVG when the buffer exceeds maxFVGs.
+pruneOldest() =>
+    if array.size(topArr) > maxFVGs
+        b = array.shift(boxArr)
+        if not na(b)
+            box.delete(b)
+        array.shift(topArr)
+        array.shift(botArr)
+        array.shift(barArr)
+        array.shift(dirArr)
+
+// Remove the FVG at index i, deleting its box and returning its direction.
+removeFVG(int i) =>
+    dir = array.get(dirArr, i)
+    b   = array.get(boxArr, i)
+    if not na(b)
+        box.delete(b)
+    array.remove(topArr, i)
+    array.remove(botArr, i)
+    array.remove(barArr, i)
+    array.remove(dirArr, i)
+    array.remove(boxArr, i)
+    dir
+
+// -----------------------------------------------------------------------------
+// FVG detection (evaluated on confirmed bars only).
+// We look at the 3-bar window ending on the current bar: bars n-2, n-1, n.
+// -----------------------------------------------------------------------------
+bullFVG = low > high[2] and (low - high[2]) >= minGapATR * atrVal
+bearFVG = high < low[2] and (low[2] - high) >= minGapATR * atrVal
+
+if barstate.isconfirmed
+    if bullFVG
+        array.push(topArr, low)              // gap top
+        array.push(botArr, high[2])          // gap bottom
+        array.push(barArr, bar_index - 2)
+        array.push(dirArr, 1)
+        bx = showFVG ? box.new(bar_index - 2, low, bar_index, high[2],
+                               border_color = color.new(color.teal, 40),
+                               bgcolor      = bullCol,
+                               extend       = extend.right) : na
+        array.push(boxArr, bx)
+        pruneOldest()
+
+    if bearFVG
+        array.push(topArr, low[2])           // gap top
+        array.push(botArr, high)             // gap bottom
+        array.push(barArr, bar_index - 2)
+        array.push(dirArr, -1)
+        bx = showFVG ? box.new(bar_index - 2, low[2], bar_index, high,
+                               border_color = color.new(color.maroon, 40),
+                               bgcolor      = bearCol,
+                               extend       = extend.right) : na
+        array.push(boxArr, bx)
+        pruneOldest()
+
+// -----------------------------------------------------------------------------
+// Scan active FVGs for invalidation. A violation flips the zone into an
+// Inverse FVG and emits a signal in the opposite direction.
+// Iterate backwards so in-place removals don't skip elements.
+// -----------------------------------------------------------------------------
+var bool iFVGLong  = false
+var bool iFVGShort = false
+var float iFVGTop  = na
+var float iFVGBot  = na
+
+iFVGLong  := false
+iFVGShort := false
+
+// Iterate from the newest to the oldest FVG. Because we only ever remove the
+// element at the current index `i`, the yet-to-be-visited indices (< i) are
+// unaffected by the shift, so backward iteration with in-place deletion is
+// correct. Pine Script auto-selects step -1 when `from` > `to`.
+if barstate.isconfirmed and array.size(topArr) > 0
+    for i = array.size(topArr) - 1 to 0
+        top = array.get(topArr, i)
+        bot = array.get(botArr, i)
+        dir = array.get(dirArr, i)
+        bar = array.get(barArr, i)
+
+        violatedBull = dir ==  1 and (useMitigCls ? close < bot : low  < bot)
+        violatedBear = dir == -1 and (useMitigCls ? close > top : high > top)
+
+        if violatedBull
+            // Bullish FVG invalidated -> bearish iFVG (short signal).
+            removeFVG(i)
+            iFVGShort := true
+            iFVGTop   := top
+            iFVGBot   := bot
+            if showIFVG
+                box.new(bar, top, bar_index, bot,
+                        border_color = color.new(color.red, 30),
+                        bgcolor      = iBearCol,
+                        extend       = extend.right)
+        else if violatedBear
+            // Bearish FVG invalidated -> bullish iFVG (long signal).
+            removeFVG(i)
+            iFVGLong := true
+            iFVGTop  := top
+            iFVGBot  := bot
+            if showIFVG
+                box.new(bar, top, bar_index, bot,
+                        border_color = color.new(color.green, 30),
+                        bgcolor      = iBullCol,
+                        extend       = extend.right)
+
+// -----------------------------------------------------------------------------
+// Entries & exits
+// -----------------------------------------------------------------------------
+longSignal  = iFVGLong  and allowLongs  and inSession and strategy.position_size <= 0
+shortSignal = iFVGShort and allowShorts and inSession and strategy.position_size >= 0
+
+longStop   = close - slMult * atrVal
+longTP     = close + slMult * atrVal * rrRatio
+shortStop  = close + slMult * atrVal
+shortTP    = close - slMult * atrVal * rrRatio
+
+if longSignal
+    strategy.entry("Long", strategy.long, comment = "iFVG Long")
+    strategy.exit ("Long TP/SL", from_entry = "Long", stop = longStop, limit = longTP,
+                   comment_loss = "SL", comment_profit = "TP")
+
+if shortSignal
+    strategy.entry("Short", strategy.short, comment = "iFVG Short")
+    strategy.exit ("Short TP/SL", from_entry = "Short", stop = shortStop, limit = shortTP,
+                   comment_loss = "SL", comment_profit = "TP")
+
+// -----------------------------------------------------------------------------
+// Plots & alerts
+// -----------------------------------------------------------------------------
+plotshape(longSignal,  title = "iFVG Long",  location = location.belowbar,
+          style = shape.triangleup,   color = color.new(color.lime, 0), size = size.small,
+          text = "iFVG\u2191", textcolor = color.white)
+plotshape(shortSignal, title = "iFVG Short", location = location.abovebar,
+          style = shape.triangledown, color = color.new(color.red,  0), size = size.small,
+          text = "iFVG\u2193", textcolor = color.white)
+
+alertcondition(longSignal,  title = "iFVG Long Entry",  message  = "iFVG long entry on {{ticker}} @ {{close}}")
+alertcondition(shortSignal, title = "iFVG Short Entry", message  = "iFVG short entry on {{ticker}} @ {{close}}")
