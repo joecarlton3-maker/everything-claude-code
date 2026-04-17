@@ -250,14 +250,17 @@ if strategy.position_size < 0
 
 // -----------------------------------------------------------------------------
 // Forced exits: double break + EOD
+// Cancel bracket orders FIRST so strategy.exit doesn't block close_all
 // -----------------------------------------------------------------------------
 if flattenOnDouble and doubleBreak and strategy.position_size != 0
+    strategy.cancel_all()
     strategy.close_all(comment = "Double Break")
 
 if flattenEOD and strategy.position_size != 0
+    strategy.cancel_all()
     strategy.close_all(comment = "EOD")
 
-if rthFinish or flattenEOD
+if rthFinish
     strategy.cancel_all()
 
 // -----------------------------------------------------------------------------
