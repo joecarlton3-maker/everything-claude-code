@@ -237,7 +237,7 @@ if useBE and not beActive and strategy.position_size != 0
     if strategy.position_size < 0 and low <= bePxShort
         beActive := true
 
-entryPx = strategy.opentrades.size > 0 ? strategy.opentrades.entry_price(0) : na
+entryPx = strategy.opentrades > 0 ? strategy.opentrades.entry_price(0) : na
 activeLongStop  = useBE and beActive ? entryPx : longStopPx
 activeShortStop = useBE and beActive ? entryPx : shortStopPx
 
