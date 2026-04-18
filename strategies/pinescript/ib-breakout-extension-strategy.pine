@@ -84,6 +84,9 @@ stopType = input.string("IB Opposite", "Stop Loss Anchor",
      options = ["IB Opposite", "IB Mid", "Custom % of IB"], group = grpRisk)
 stopPctIB = input.float(0.5, "Custom Stop (x IB Range)", step = 0.1, group = grpRisk)
 flattenOnDouble = input.bool(true, "Flatten on Double Break", group = grpRisk)
+useBE  = input.bool(true, "Move Stop to Breakeven", group = grpRisk,
+     tooltip = "After the trigger tier fills, move the stop for all remaining exits to the entry price.")
+beTier = input.int(2, "BE Trigger Tier (1-5)", minval = 1, maxval = 5, group = grpRisk)
 exitMinsBefore  = input.int(15, "Flatten N Minutes Before Close", minval = 0, group = grpRisk)
 
 grpFilter = "Filters"
@@ -153,11 +156,13 @@ dnL5 = ibLocked ? ibLow - ibRange * m5 : na
 var bool brokeAbove  = false
 var bool brokeBelow  = false
 var bool doubleBreak = false
+var bool beActive    = false
 
 if rthStart
     brokeAbove  := false
     brokeBelow  := false
     doubleBreak := false
+    beActive    := false
 
 // -----------------------------------------------------------------------------
 // Stop loss anchors
@@ -222,31 +227,46 @@ if doubleBreak
     strategy.cancel("S")
 
 // -----------------------------------------------------------------------------
+// Breakeven stop detection
+// -----------------------------------------------------------------------------
+if useBE and not beActive and strategy.position_size != 0
+    bePxLong  = beTier == 1 ? upL1 : beTier == 2 ? upL2 : beTier == 3 ? upL3 : beTier == 4 ? upL4 : upL5
+    bePxShort = beTier == 1 ? dnL1 : beTier == 2 ? dnL2 : beTier == 3 ? dnL3 : beTier == 4 ? dnL4 : dnL5
+    if strategy.position_size > 0 and high >= bePxLong
+        beActive := true
+    if strategy.position_size < 0 and low <= bePxShort
+        beActive := true
+
+entryPx = strategy.opentrades.size > 0 ? strategy.opentrades.entry_price(0) : na
+activeLongStop  = useBE and beActive ? entryPx : longStopPx
+activeShortStop = useBE and beActive ? entryPx : shortStopPx
+
+// -----------------------------------------------------------------------------
 // Scaled exits
 // -----------------------------------------------------------------------------
 if strategy.position_size > 0
     if useT1
-        strategy.exit("X1L", from_entry = "L", limit = upL1, stop = longStopPx, qty_percent = p1)
+        strategy.exit("X1L", from_entry = "L", limit = upL1, stop = activeLongStop, qty_percent = p1)
     if useT2
-        strategy.exit("X2L", from_entry = "L", limit = upL2, stop = longStopPx, qty_percent = p2)
+        strategy.exit("X2L", from_entry = "L", limit = upL2, stop = activeLongStop, qty_percent = p2)
     if useT3
-        strategy.exit("X3L", from_entry = "L", limit = upL3, stop = longStopPx, qty_percent = p3)
+        strategy.exit("X3L", from_entry = "L", limit = upL3, stop = activeLongStop, qty_percent = p3)
     if useT4
-        strategy.exit("X4L", from_entry = "L", limit = upL4, stop = longStopPx, qty_percent = p4)
+        strategy.exit("X4L", from_entry = "L", limit = upL4, stop = activeLongStop, qty_percent = p4)
     if useT5
-        strategy.exit("X5L", from_entry = "L", limit = upL5, stop = longStopPx, qty_percent = p5)
+        strategy.exit("X5L", from_entry = "L", limit = upL5, stop = activeLongStop, qty_percent = p5)
 
 if strategy.position_size < 0
     if useT1
-        strategy.exit("X1S", from_entry = "S", limit = dnL1, stop = shortStopPx, qty_percent = p1)
+        strategy.exit("X1S", from_entry = "S", limit = dnL1, stop = activeShortStop, qty_percent = p1)
     if useT2
-        strategy.exit("X2S", from_entry = "S", limit = dnL2, stop = shortStopPx, qty_percent = p2)
+        strategy.exit("X2S", from_entry = "S", limit = dnL2, stop = activeShortStop, qty_percent = p2)
     if useT3
-        strategy.exit("X3S", from_entry = "S", limit = dnL3, stop = shortStopPx, qty_percent = p3)
+        strategy.exit("X3S", from_entry = "S", limit = dnL3, stop = activeShortStop, qty_percent = p3)
     if useT4
-        strategy.exit("X4S", from_entry = "S", limit = dnL4, stop = shortStopPx, qty_percent = p4)
+        strategy.exit("X4S", from_entry = "S", limit = dnL4, stop = activeShortStop, qty_percent = p4)
     if useT5
-        strategy.exit("X5S", from_entry = "S", limit = dnL5, stop = shortStopPx, qty_percent = p5)
+        strategy.exit("X5S", from_entry = "S", limit = dnL5, stop = activeShortStop, qty_percent = p5)
 
 // -----------------------------------------------------------------------------
 // Forced exits: double break + EOD
