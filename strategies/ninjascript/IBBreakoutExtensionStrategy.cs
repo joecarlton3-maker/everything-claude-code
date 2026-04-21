@@ -4,7 +4,7 @@
 // Port of the Pine Script IB Breakout Extension strategy.
 //
 // Concept
-//   * IB = high/low of 09:30-10:30 ET (configurable).
+//   * IB = high/low of the first hour of RTH (configurable).
 //   * After IB completes, two stop entries are armed (OCA-like behavior):
 //        - Long  stop at IB high  (breakout)
 //        - Short stop at IB low   (breakdown)
@@ -12,33 +12,24 @@
 //   * If price later violates the OPPOSITE side of the IB, the day is
 //     reclassified as a "double break" and the position is flattened.
 //   * Scaled exits at IB-range extensions: 0.2 / 0.4 / 0.6 / 0.8 / 1.0 x IB.
-//   * Optional breakeven stop: once the configured tier fills, move the
-//     stop for all remaining exits to the entry price.
+//   * Optional breakeven stop triggered at a configurable tier.
 //
-// NinjaTrader Notes
-//   * NinjaScript does not have native OCA, so we cancel the opposite
-//     pending entry inside OnOrderUpdate/OnBarUpdate when the other fills.
-//   * Scaled exits are submitted as separate ExitLongLimit/ExitShortLimit
-//     signals with fixed per-tier quantities computed from the position's
-//     initial size.
-//   * The protective stop is re-submitted each bar via ExitLongStopMarket
-//     / ExitShortStopMarket on the remaining position size.  When BE
-//     triggers, the stop price is swapped to the average entry price.
-//   * Designed for Calculate.OnEachTick; also works on OnBarClose with
-//     1-minute bars.  Prefer OnEachTick for accurate intrabar tier fills.
+// Session times use the CHART's timezone directly (no conversion).
+//   - If your chart displays Eastern Time, use defaults (9:30 / 10:30 / 16:00).
+//   - If your chart displays Central Time, set IB to 8:30-9:30 and RTH end 15:00.
+//   - NinjaTrader bar timestamps (Time[0]) reflect the bar CLOSE time.
+//     The time comparisons account for this automatically.
 // =============================================================================
 
 #region Using declarations
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
-using System.Linq;
 using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
-using NinjaTrader.NinjaScript.Strategies;
+using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -76,14 +67,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Order longEntryOrder;
         private Order shortEntryOrder;
 
-        private DateTime lastSessionDate = DateTime.MinValue;
-        private TimeZoneInfo easternTz;
+        private int    ibFinishBarIndex;
+        private string sessionTag;
+
+        private Brush doubleBreakBrush;
 
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
-                Description                 = "IB Breakout Extension Strategy — scaled exits at IB-range extensions.";
+                Description                 = "IB Breakout Extension Strategy — scaled exits at IB-range extensions. "
+                    + "Set IB/RTH hours to match your chart's timezone.";
                 Name                        = "IBBreakoutExtensionStrategy";
                 Calculate                   = Calculate.OnEachTick;
                 EntriesPerDirection         = 1;
@@ -102,81 +96,64 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarsRequiredToTrade         = 20;
                 IsInstantiatedOnEachOptimizationIteration = true;
 
-                // ---- User inputs (defaults match the Pine Script) ----
-                IBStartHour        = 9;
-                IBStartMinute      = 30;
-                IBEndHour          = 10;
-                IBEndMinute        = 30;
-                RTHEndHour         = 16;
-                RTHEndMinute       = 0;
-                SessionTimeZoneId  = "Eastern Standard Time";
+                IBStartHour         = 9;
+                IBStartMinute       = 30;
+                IBEndHour           = 10;
+                IBEndMinute         = 30;
+                RTHEndHour          = 16;
+                RTHEndMinute        = 0;
 
-                TradeLongs         = true;
-                TradeShorts        = true;
+                TradeLongs          = true;
+                TradeShorts         = true;
 
-                UseT1 = true; Mult1 = 0.2; Pct1 = 20;
-                UseT2 = true; Mult2 = 0.4; Pct2 = 25;
-                UseT3 = true; Mult3 = 0.6; Pct3 = 20;
-                UseT4 = true; Mult4 = 0.8; Pct4 = 20;
-                UseT5 = true; Mult5 = 1.0; Pct5 = 15;
+                UseT1 = true;  Mult1 = 0.2;  Pct1 = 20;
+                UseT2 = true;  Mult2 = 0.4;  Pct2 = 25;
+                UseT3 = true;  Mult3 = 0.6;  Pct3 = 20;
+                UseT4 = true;  Mult4 = 0.8;  Pct4 = 20;
+                UseT5 = true;  Mult5 = 1.0;  Pct5 = 15;
 
-                StopAnchor         = IBStopAnchorType.IBOpposite;
-                CustomStopMultIB   = 0.5;
-                FlattenOnDouble    = true;
-                UseBreakeven       = true;
-                BETier             = 2;
+                StopAnchor          = IBStopAnchorType.IBOpposite;
+                CustomStopMultIB    = 0.5;
+                FlattenOnDouble     = true;
+                UseBreakeven        = true;
+                BETier              = 2;
                 ExitMinsBeforeClose = 15;
 
-                MinIBRangePct      = 0.0;
-                MaxIBRangePct      = 5.0;
+                MinIBRangePct       = 0.0;
+                MaxIBRangePct       = 5.0;
 
-                Contracts          = 10;
-            }
-            else if (State == State.Configure)
-            {
-                try
-                {
-                    easternTz = TimeZoneInfo.FindSystemTimeZoneById(SessionTimeZoneId);
-                }
-                catch
-                {
-                    easternTz = TimeZoneInfo.Local;
-                }
+                Contracts           = 10;
+
+                ShowIB              = true;
+                ShowTargets         = true;
+                ShowStats           = true;
+                SymProfile          = "NQ";
             }
             else if (State == State.DataLoaded)
             {
                 ResetDayState();
+                doubleBreakBrush = new SolidColorBrush(Color.FromArgb(25, 255, 165, 0));
+                doubleBreakBrush.Freeze();
             }
         }
 
         private void ResetDayState()
         {
-            ibHigh = 0;
-            ibLow = 0;
-            ibMid = 0;
-            ibRange = 0;
-            ibLocked = false;
-            brokeAbove = false;
-            brokeBelow = false;
-            doubleBreak = false;
-            beActive = false;
-            initialQty = 0;
-            entryPrice = 0;
-            longEntryOrder = null;
+            ibHigh          = 0;
+            ibLow           = 0;
+            ibMid           = 0;
+            ibRange         = 0;
+            ibLocked        = false;
+            brokeAbove      = false;
+            brokeBelow      = false;
+            doubleBreak     = false;
+            beActive        = false;
+            initialQty      = 0;
+            entryPrice      = 0;
+            longEntryOrder  = null;
             shortEntryOrder = null;
-        }
-
-        private DateTime ToEastern(DateTime t)
-        {
-            try
-            {
-                DateTime utc = t.Kind == DateTimeKind.Utc ? t : TimeZoneInfo.ConvertTimeToUtc(t, TimeZoneInfo.Local);
-                return TimeZoneInfo.ConvertTimeFromUtc(utc, easternTz);
-            }
-            catch
-            {
-                return t;
-            }
+            ibFinishBarIndex = 0;
+            sessionTag      = "";
         }
 
         protected override void OnBarUpdate()
@@ -184,35 +161,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (BarsInProgress != 0) return;
             if (CurrentBar < BarsRequiredToTrade) return;
 
-            DateTime et = ToEastern(Time[0]);
-
-            if (et.Date != lastSessionDate)
-            {
+            // ---- Session reset ----
+            if (Bars.IsFirstBarOfSession)
                 ResetDayState();
-                lastSessionDate = et.Date;
-            }
 
-            int barMins      = et.Hour * 60 + et.Minute;
-            int ibStartMins  = IBStartHour * 60 + IBStartMinute;
-            int ibEndMins    = IBEndHour   * 60 + IBEndMinute;
-            int rthStartMins = ibStartMins;
-            int rthEndMins   = RTHEndHour  * 60 + RTHEndMinute;
+            // ---- Time detection (chart-native, no TZ conversion) ----
+            int t    = ToTime(Time[0]);
+            int ibSt = IBStartHour * 10000 + IBStartMinute * 100;
+            int ibEn = IBEndHour   * 10000 + IBEndMinute   * 100;
+            int rthEn = RTHEndHour * 10000 + RTHEndMinute  * 100;
 
-            bool inIB  = barMins >= ibStartMins  && barMins <  ibEndMins;
-            bool inRTH = barMins >= rthStartMins && barMins <  rthEndMins;
+            bool inIB  = t > ibSt  && t <= ibEn;
+            bool inRTH = t > ibSt  && t <= rthEn;
 
             bool prevInIB  = false;
             bool prevInRTH = false;
-            if (CurrentBar >= 1)
+            if (CurrentBar >= 1 && !Bars.IsFirstBarOfSession)
             {
-                DateTime etPrev = ToEastern(Time[1]);
-                int prevMins = etPrev.Hour * 60 + etPrev.Minute;
-                bool sameDay = etPrev.Date == et.Date;
-                prevInIB  = sameDay && prevMins >= ibStartMins  && prevMins <  ibEndMins;
-                prevInRTH = sameDay && prevMins >= rthStartMins && prevMins <  rthEndMins;
+                int tp = ToTime(Time[1]);
+                prevInIB  = tp > ibSt  && tp <= ibEn;
+                prevInRTH = tp > ibSt  && tp <= rthEn;
             }
+
             bool ibStart   = inIB  && !prevInIB;
-            bool ibFinish  = !inIB && prevInIB;
+            bool ibFinish  = !inIB && prevInIB && inRTH;
             bool rthStart  = inRTH && !prevInRTH;
             bool rthFinish = !inRTH && prevInRTH;
 
@@ -229,11 +201,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ibLow  = Math.Min(ibLow,  Low[0]);
             }
 
-            if (ibFinish)
+            if (ibFinish && ibHigh > 0 && ibLow > 0)
             {
                 ibMid    = (ibHigh + ibLow) / 2.0;
                 ibRange  = ibHigh - ibLow;
                 ibLocked = true;
+                ibFinishBarIndex = CurrentBar;
+                sessionTag = Time[0].ToString("yyyyMMdd");
+
+                // Compute targets once at IB lock
+                upL1 = ibHigh + ibRange * Mult1;
+                upL2 = ibHigh + ibRange * Mult2;
+                upL3 = ibHigh + ibRange * Mult3;
+                upL4 = ibHigh + ibRange * Mult4;
+                upL5 = ibHigh + ibRange * Mult5;
+                dnL1 = ibLow  - ibRange * Mult1;
+                dnL2 = ibLow  - ibRange * Mult2;
+                dnL3 = ibLow  - ibRange * Mult3;
+                dnL4 = ibLow  - ibRange * Mult4;
+                dnL5 = ibLow  - ibRange * Mult5;
+
+                // Draw probability labels once at IB completion
+                if (ShowStats)
+                    DrawProbLabels();
             }
 
             if (rthStart)
@@ -245,18 +235,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (!ibLocked) return;
-
-            // ---- Extension targets ----
-            upL1 = ibHigh + ibRange * Mult1;
-            upL2 = ibHigh + ibRange * Mult2;
-            upL3 = ibHigh + ibRange * Mult3;
-            upL4 = ibHigh + ibRange * Mult4;
-            upL5 = ibHigh + ibRange * Mult5;
-            dnL1 = ibLow  - ibRange * Mult1;
-            dnL2 = ibLow  - ibRange * Mult2;
-            dnL3 = ibLow  - ibRange * Mult3;
-            dnL4 = ibLow  - ibRange * Mult4;
-            dnL5 = ibLow  - ibRange * Mult5;
 
             // ---- Stop anchors ----
             switch (StopAnchor)
@@ -280,8 +258,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool rangeOK = ibRangePct >= MinIBRangePct && ibRangePct <= MaxIBRangePct;
 
             // ---- EOD guard ----
-            int closeMin = rthEndMins - ExitMinsBeforeClose;
-            bool flattenEOD = inRTH && barMins >= closeMin;
+            int eodMins = (RTHEndHour * 60 + RTHEndMinute) - ExitMinsBeforeClose;
+            int eodTime = (eodMins / 60) * 10000 + (eodMins % 60) * 100;
+            bool flattenEOD = inRTH && t >= eodTime;
 
             bool canArm = ibLocked && inRTH && !doubleBreak && rangeOK && !flattenEOD
                           && Position.MarketPosition == MarketPosition.Flat;
@@ -295,7 +274,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     EnterShortStopMarket(0, true, Contracts, ibLow, "S");
             }
 
-            // Cancel opposite pending entry once we're in a trade
             if (Position.MarketPosition == MarketPosition.Long && shortEntryOrder != null)
             {
                 CancelOrder(shortEntryOrder);
@@ -391,14 +369,118 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (remaining > 0)
                     ExitShortStopMarket(0, true, remaining, activeShortStop, "StopS", "S");
             }
+
+            // ---- Visualization (once per bar for performance) ----
+            if (IsFirstTickOfBar && ibLocked && sessionTag.Length > 0)
+            {
+                int bb = CurrentBar - ibFinishBarIndex;
+                if (bb < 0) bb = 0;
+
+                if (ShowIB)
+                {
+                    Draw.Line(this, "IBH" + sessionTag, false, bb, ibHigh, 0, ibHigh,
+                        Brushes.Aqua, DashStyleHelper.Solid, 2);
+                    Draw.Line(this, "IBL" + sessionTag, false, bb, ibLow, 0, ibLow,
+                        Brushes.Fuchsia, DashStyleHelper.Solid, 2);
+                    Draw.Line(this, "IBM" + sessionTag, false, bb, ibMid, 0, ibMid,
+                        Brushes.Gray, DashStyleHelper.Dash, 1);
+                }
+
+                if (ShowTargets)
+                {
+                    if (UseT1)
+                    {
+                        Draw.Line(this, "U1" + sessionTag, false, bb, upL1, 0, upL1,
+                            Brushes.Lime, DashStyleHelper.Dot, 1);
+                        Draw.Line(this, "D1" + sessionTag, false, bb, dnL1, 0, dnL1,
+                            Brushes.Red, DashStyleHelper.Dot, 1);
+                    }
+                    if (UseT2)
+                    {
+                        Draw.Line(this, "U2" + sessionTag, false, bb, upL2, 0, upL2,
+                            Brushes.Lime, DashStyleHelper.Dot, 1);
+                        Draw.Line(this, "D2" + sessionTag, false, bb, dnL2, 0, dnL2,
+                            Brushes.Red, DashStyleHelper.Dot, 1);
+                    }
+                    if (UseT3)
+                    {
+                        Draw.Line(this, "U3" + sessionTag, false, bb, upL3, 0, upL3,
+                            Brushes.LimeGreen, DashStyleHelper.Dot, 1);
+                        Draw.Line(this, "D3" + sessionTag, false, bb, dnL3, 0, dnL3,
+                            Brushes.OrangeRed, DashStyleHelper.Dot, 1);
+                    }
+                    if (UseT4)
+                    {
+                        Draw.Line(this, "U4" + sessionTag, false, bb, upL4, 0, upL4,
+                            Brushes.LimeGreen, DashStyleHelper.Dot, 1);
+                        Draw.Line(this, "D4" + sessionTag, false, bb, dnL4, 0, dnL4,
+                            Brushes.OrangeRed, DashStyleHelper.Dot, 1);
+                    }
+                    if (UseT5)
+                    {
+                        Draw.Line(this, "U5" + sessionTag, false, bb, upL5, 0, upL5,
+                            Brushes.DarkGreen, DashStyleHelper.Dot, 1);
+                        Draw.Line(this, "D5" + sessionTag, false, bb, dnL5, 0, dnL5,
+                            Brushes.DarkRed, DashStyleHelper.Dot, 1);
+                    }
+                }
+
+                if (doubleBreak)
+                    BackBrushes[0] = doubleBreakBrush;
+            }
         }
 
+        // ---- Helpers ----
         private static int TierQty(int total, double pct)
         {
             int q = (int)Math.Floor(total * pct / 100.0);
             return q < 0 ? 0 : q;
         }
 
+        private double GetProb(int idx)
+        {
+            switch (SymProfile)
+            {
+                case "ES":
+                    return idx == 0 ? 92.2 : idx == 1 ? 77.7 : idx == 2 ? 60.6 : idx == 3 ? 52.4 : 39.4;
+                case "YM":
+                    return idx == 0 ? 86.3 : idx == 1 ? 69.1 : idx == 2 ? 51.2 : idx == 3 ? 40.2 : 29.2;
+                default:
+                    return idx == 0 ? 87.5 : idx == 1 ? 70.3 : idx == 2 ? 52.1 : idx == 3 ? 36.1 : 25.2;
+            }
+        }
+
+        private void DrawProbLabels()
+        {
+            string s = sessionTag;
+            if (UseT1)
+            {
+                Draw.Text(this, "PU1" + s, "+0.2  " + GetProb(0).ToString("0.#") + "%", 0, upL1, Brushes.Lime);
+                Draw.Text(this, "PD1" + s, "-0.2  " + GetProb(0).ToString("0.#") + "%", 0, dnL1, Brushes.Red);
+            }
+            if (UseT2)
+            {
+                Draw.Text(this, "PU2" + s, "+0.4  " + GetProb(1).ToString("0.#") + "%", 0, upL2, Brushes.Lime);
+                Draw.Text(this, "PD2" + s, "-0.4  " + GetProb(1).ToString("0.#") + "%", 0, dnL2, Brushes.Red);
+            }
+            if (UseT3)
+            {
+                Draw.Text(this, "PU3" + s, "+0.6  " + GetProb(2).ToString("0.#") + "%", 0, upL3, Brushes.LimeGreen);
+                Draw.Text(this, "PD3" + s, "-0.6  " + GetProb(2).ToString("0.#") + "%", 0, dnL3, Brushes.OrangeRed);
+            }
+            if (UseT4)
+            {
+                Draw.Text(this, "PU4" + s, "+0.8  " + GetProb(3).ToString("0.#") + "%", 0, upL4, Brushes.LimeGreen);
+                Draw.Text(this, "PD4" + s, "-0.8  " + GetProb(3).ToString("0.#") + "%", 0, dnL4, Brushes.OrangeRed);
+            }
+            if (UseT5)
+            {
+                Draw.Text(this, "PU5" + s, "+1.0  " + GetProb(4).ToString("0.#") + "%", 0, upL5, Brushes.DarkGreen);
+                Draw.Text(this, "PD5" + s, "-1.0  " + GetProb(4).ToString("0.#") + "%", 0, dnL5, Brushes.DarkRed);
+            }
+        }
+
+        // ---- Order / Execution callbacks ----
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity,
             int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
         {
@@ -422,7 +504,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (execution.Order.OrderState != OrderState.Filled && execution.Order.OrderState != OrderState.PartFilled)
                 return;
 
-            // Capture initial position size + entry price on entry fill
             if (execution.Order.Name == "L" || execution.Order.Name == "S")
             {
                 if (Position.MarketPosition != MarketPosition.Flat)
@@ -432,118 +513,140 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // Reset on full exit
             if (Position.MarketPosition == MarketPosition.Flat)
             {
                 initialQty = 0;
                 entryPrice = 0;
-                beActive = false;
+                beActive   = false;
             }
         }
 
         // =====================================================================
         // Properties
         // =====================================================================
+
+        // -- Session --
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "IB Start Hour (ET)",   GroupName = "Session", Order = 1)]
+        [Display(Name = "IB Start Hour",   GroupName = "1. Session", Order = 1,
+            Description = "Hour the IB window opens, in your chart's timezone. ET=9, CT=8.")]
         public int IBStartHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name = "IB Start Minute (ET)", GroupName = "Session", Order = 2)]
+        [Display(Name = "IB Start Minute", GroupName = "1. Session", Order = 2)]
         public int IBStartMinute { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "IB End Hour (ET)",     GroupName = "Session", Order = 3)]
+        [Display(Name = "IB End Hour",     GroupName = "1. Session", Order = 3,
+            Description = "Hour the IB window closes, in your chart's timezone. ET=10, CT=9.")]
         public int IBEndHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name = "IB End Minute (ET)",   GroupName = "Session", Order = 4)]
+        [Display(Name = "IB End Minute",   GroupName = "1. Session", Order = 4)]
         public int IBEndMinute { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "RTH End Hour (ET)",    GroupName = "Session", Order = 5)]
+        [Display(Name = "RTH End Hour",    GroupName = "1. Session", Order = 5,
+            Description = "Hour RTH closes, in your chart's timezone. ET=16, CT=15.")]
         public int RTHEndHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name = "RTH End Minute (ET)",  GroupName = "Session", Order = 6)]
+        [Display(Name = "RTH End Minute",  GroupName = "1. Session", Order = 6)]
         public int RTHEndMinute { get; set; }
 
+        // -- Direction --
         [NinjaScriptProperty]
-        [Display(Name = "Session Time Zone Id", GroupName = "Session", Order = 7,
-            Description = "Windows time zone id. Default: Eastern Standard Time")]
-        public string SessionTimeZoneId { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Take Breakout Longs",   GroupName = "Trade Direction", Order = 1)]
+        [Display(Name = "Take Breakout Longs",   GroupName = "2. Trade Direction", Order = 1)]
         public bool TradeLongs { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Take Breakdown Shorts", GroupName = "Trade Direction", Order = 2)]
+        [Display(Name = "Take Breakdown Shorts", GroupName = "2. Trade Direction", Order = 2)]
         public bool TradeShorts { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Contracts per Trade", GroupName = "Trade Direction", Order = 3)]
+        [Display(Name = "Contracts per Trade", GroupName = "2. Trade Direction", Order = 3,
+            Description = "Use >= 7 for all 5 tiers to get at least 1 contract per tier.")]
         public int Contracts { get; set; }
 
-        [NinjaScriptProperty] [Display(Name = "Use T1 (0.2)", GroupName = "Targets", Order = 1)]  public bool   UseT1 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T1 Mult",      GroupName = "Targets", Order = 2)]  public double Mult1 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T1 % Out",     GroupName = "Targets", Order = 3)]  public double Pct1  { get; set; }
+        // -- Targets --
+        [NinjaScriptProperty] [Display(Name = "Use T1", GroupName = "3. Targets", Order = 1)]  public bool   UseT1 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T1 Mult",      GroupName = "3. Targets", Order = 2)]  public double Mult1 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T1 % Out",     GroupName = "3. Targets", Order = 3)]  public double Pct1  { get; set; }
 
-        [NinjaScriptProperty] [Display(Name = "Use T2 (0.4)", GroupName = "Targets", Order = 4)]  public bool   UseT2 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T2 Mult",      GroupName = "Targets", Order = 5)]  public double Mult2 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T2 % Out",     GroupName = "Targets", Order = 6)]  public double Pct2  { get; set; }
+        [NinjaScriptProperty] [Display(Name = "Use T2", GroupName = "3. Targets", Order = 4)]  public bool   UseT2 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T2 Mult",      GroupName = "3. Targets", Order = 5)]  public double Mult2 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T2 % Out",     GroupName = "3. Targets", Order = 6)]  public double Pct2  { get; set; }
 
-        [NinjaScriptProperty] [Display(Name = "Use T3 (0.6)", GroupName = "Targets", Order = 7)]  public bool   UseT3 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T3 Mult",      GroupName = "Targets", Order = 8)]  public double Mult3 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T3 % Out",     GroupName = "Targets", Order = 9)]  public double Pct3  { get; set; }
+        [NinjaScriptProperty] [Display(Name = "Use T3", GroupName = "3. Targets", Order = 7)]  public bool   UseT3 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T3 Mult",      GroupName = "3. Targets", Order = 8)]  public double Mult3 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T3 % Out",     GroupName = "3. Targets", Order = 9)]  public double Pct3  { get; set; }
 
-        [NinjaScriptProperty] [Display(Name = "Use T4 (0.8)", GroupName = "Targets", Order = 10)] public bool   UseT4 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T4 Mult",      GroupName = "Targets", Order = 11)] public double Mult4 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T4 % Out",     GroupName = "Targets", Order = 12)] public double Pct4  { get; set; }
+        [NinjaScriptProperty] [Display(Name = "Use T4", GroupName = "3. Targets", Order = 10)] public bool   UseT4 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T4 Mult",      GroupName = "3. Targets", Order = 11)] public double Mult4 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T4 % Out",     GroupName = "3. Targets", Order = 12)] public double Pct4  { get; set; }
 
-        [NinjaScriptProperty] [Display(Name = "Use T5 (1.0)", GroupName = "Targets", Order = 13)] public bool   UseT5 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T5 Mult",      GroupName = "Targets", Order = 14)] public double Mult5 { get; set; }
-        [NinjaScriptProperty] [Display(Name = "T5 % Out",     GroupName = "Targets", Order = 15)] public double Pct5  { get; set; }
+        [NinjaScriptProperty] [Display(Name = "Use T5", GroupName = "3. Targets", Order = 13)] public bool   UseT5 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T5 Mult",      GroupName = "3. Targets", Order = 14)] public double Mult5 { get; set; }
+        [NinjaScriptProperty] [Display(Name = "T5 % Out",     GroupName = "3. Targets", Order = 15)] public double Pct5  { get; set; }
 
+        // -- Risk --
         [NinjaScriptProperty]
-        [Display(Name = "Stop Anchor", GroupName = "Risk", Order = 1)]
+        [Display(Name = "Stop Anchor", GroupName = "4. Risk", Order = 1)]
         public IBStopAnchorType StopAnchor { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Custom Stop (x IB Range)", GroupName = "Risk", Order = 2)]
+        [Display(Name = "Custom Stop (x IB Range)", GroupName = "4. Risk", Order = 2)]
         public double CustomStopMultIB { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Flatten on Double Break", GroupName = "Risk", Order = 3)]
+        [Display(Name = "Flatten on Double Break", GroupName = "4. Risk", Order = 3)]
         public bool FlattenOnDouble { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Move Stop to Breakeven", GroupName = "Risk", Order = 4)]
+        [Display(Name = "Move Stop to Breakeven", GroupName = "4. Risk", Order = 4)]
         public bool UseBreakeven { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 5)]
-        [Display(Name = "BE Trigger Tier (1-5)", GroupName = "Risk", Order = 5)]
+        [Display(Name = "BE Trigger Tier (1-5)", GroupName = "4. Risk", Order = 5)]
         public int BETier { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 240)]
-        [Display(Name = "Flatten N Minutes Before Close", GroupName = "Risk", Order = 6)]
+        [Display(Name = "Flatten N Minutes Before Close", GroupName = "4. Risk", Order = 6)]
         public int ExitMinsBeforeClose { get; set; }
 
+        // -- Filters --
         [NinjaScriptProperty]
-        [Display(Name = "Min IB Range (% of price)", GroupName = "Filters", Order = 1)]
+        [Display(Name = "Min IB Range (% of price)", GroupName = "5. Filters", Order = 1)]
         public double MinIBRangePct { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Max IB Range (% of price)", GroupName = "Filters", Order = 2)]
+        [Display(Name = "Max IB Range (% of price)", GroupName = "5. Filters", Order = 2)]
         public double MaxIBRangePct { get; set; }
+
+        // -- Visualization --
+        [NinjaScriptProperty]
+        [Display(Name = "Draw IB High/Low/Mid", GroupName = "6. Visualization", Order = 1)]
+        public bool ShowIB { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Draw Target Levels", GroupName = "6. Visualization", Order = 2)]
+        public bool ShowTargets { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Probability Labels", GroupName = "6. Visualization", Order = 3)]
+        public bool ShowStats { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Probability Profile (NQ/ES/YM)", GroupName = "6. Visualization", Order = 4,
+            Description = "Which instrument's hit-rate stats to display on labels.")]
+        public string SymProfile { get; set; }
     }
 }
