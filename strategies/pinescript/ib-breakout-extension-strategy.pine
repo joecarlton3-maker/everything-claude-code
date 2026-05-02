@@ -7,9 +7,10 @@
 //
 // Concept
 //   * IB = high/low of 09:30-10:30 ET (configurable).
-//   * After IB completes, two stop entries are armed in an OCA group:
-//        - Long  stop at IB high  (breakout)
-//        - Short stop at IB low   (breakdown)
+//   * Two entry modes:
+//        Breakout:    stop entries at IB high/low (original)
+//        Retracement: after breakout, limit entries at a % pullback into the IB
+//   * After IB completes, entries are armed in an OCA group.
 //     Whichever fills first becomes the trade; the other is canceled.
 //   * If price later violates the OPPOSITE side of the IB, the day is
 //     reclassified as a "double break" and the position is flattened.
@@ -53,10 +54,32 @@ grpSession = "Session"
 ibSess  = input.session("0930-1030", "Initial Balance Window", group = grpSession)
 rthSess = input.session("0930-1600", "RTH Window",             group = grpSession)
 sessTz  = input.string ("America/New_York", "Timezone",        group = grpSession)
+useCutoff    = input.bool(true,  "Entry Cutoff Time",  group = grpSession,
+     tooltip = "Stop arming new entries after this time. Prevents late-day low-probability setups.")
+cutoffHour   = input.int (12,    "Cutoff Hour",        group = grpSession, minval = 0, maxval = 23)
+cutoffMinute = input.int (30,    "Cutoff Minute",      group = grpSession, minval = 0, maxval = 59)
+
+grpEntry = "Entry Mode"
+useRetrace = input.bool(false, "Use Retracement Entry", group = grpEntry,
+     tooltip = "Instead of stop entries at the IB edge, wait for a confirmed breakout then enter on a limit pullback into the IB range. Better fill price, fewer fakeouts.")
+retracePct = input.float(25, "Entry Retracement (% of IB)", group = grpEntry, step = 5, minval = 1, maxval = 99,
+     tooltip = "How far back into the IB range to place the limit entry after breakout. 25 = entry at IB high minus 25% of IB range for longs.")
 
 grpDir      = "Trade Direction"
 tradeLongs  = input.bool(true, "Take Breakout Longs",   group = grpDir)
 tradeShorts = input.bool(true, "Take Breakdown Shorts", group = grpDir)
+
+grpDOW = "Day of Week Filters"
+monLong  = input.bool(false, "Monday    — Longs",    group = grpDOW, inline = "mon")
+monShort = input.bool(false, "Shorts",               group = grpDOW, inline = "mon")
+tueLong  = input.bool(false, "Tuesday   — Longs",    group = grpDOW, inline = "tue")
+tueShort = input.bool(false, "Shorts",               group = grpDOW, inline = "tue")
+wedLong  = input.bool(true,  "Wednesday — Longs",    group = grpDOW, inline = "wed")
+wedShort = input.bool(true,  "Shorts",               group = grpDOW, inline = "wed")
+thuLong  = input.bool(true,  "Thursday  — Longs",    group = grpDOW, inline = "thu")
+thuShort = input.bool(true,  "Shorts",               group = grpDOW, inline = "thu")
+friLong  = input.bool(true,  "Friday    — Longs",    group = grpDOW, inline = "fri")
+friShort = input.bool(true,  "Shorts",               group = grpDOW, inline = "fri")
 
 grpTgt = "Targets (IB-Range Extensions)"
 useT1 = input.bool (true, "Use 0.2 Target", group = grpTgt, inline = "t1")
@@ -81,8 +104,11 @@ p5    = input.float(15,   "% Out",          group = grpTgt, inline = "t5", step 
 
 grpRisk = "Risk Management"
 stopType = input.string("IB Opposite", "Stop Loss Anchor",
-     options = ["IB Opposite", "IB Mid", "Custom % of IB"], group = grpRisk)
-stopPctIB = input.float(0.5, "Custom Stop (x IB Range)", step = 0.1, group = grpRisk)
+     options = ["IB Opposite", "IB Mid", "Custom % of IB", "IB Retracement"], group = grpRisk)
+stopPctIB = input.float(0.5, "Custom Stop (x IB Range)", step = 0.1, group = grpRisk,
+     tooltip = "Used when Stop Loss Anchor = 'Custom % of IB'.")
+stopRetracePct = input.float(80, "Stop Retracement (% of IB)", step = 5, group = grpRisk, minval = 1, maxval = 99,
+     tooltip = "Used when Stop Loss Anchor = 'IB Retracement'. Stop at this % retracement from the breakout side. 80 = stop at 80% of IB range below IB high for longs (near IB low).")
 flattenOnDouble = input.bool(true, "Flatten on Double Break", group = grpRisk)
 useBE  = input.bool(true, "Move Stop to Breakeven", group = grpRisk,
      tooltip = "After the trigger tier fills, move the stop for all remaining exits to the entry price.")
@@ -92,12 +118,13 @@ exitMinsBefore  = input.int(15, "Flatten N Minutes Before Close", minval = 0, gr
 grpFilter = "Filters"
 minIBRangePct = input.float(0.0, "Min IB Range (% of price)", step = 0.05, group = grpFilter,
      tooltip = "Skip trades when the IB range is too tight. Larger ranges historically have lower double-break rates.")
-maxIBRangePct = input.float(5.0, "Max IB Range (% of price)", step = 0.05, group = grpFilter)
+maxIBRangePct = input.float(1.0, "Max IB Range (% of price)", step = 0.05, group = grpFilter)
 
 grpView     = "Visualization"
 showIB      = input.bool(true, "Draw IB High/Low/Mid", group = grpView)
 showTargets = input.bool(true, "Draw Target Levels",   group = grpView)
 showStats   = input.bool(true, "Show Probability Labels", group = grpView)
+showRetrace = input.bool(true, "Draw Retracement Entry Level", group = grpView)
 sym         = input.string("NQ", "Probability Profile",
      options = ["NQ", "ES", "YM"], group = grpView)
 
@@ -111,6 +138,22 @@ ibStart   = inIB  and not inIB[1]
 ibFinish  = not inIB and inIB[1]
 rthStart  = inRTH and not inRTH[1]
 rthFinish = not inRTH and inRTH[1]
+
+// -----------------------------------------------------------------------------
+// Day-of-week filter
+// -----------------------------------------------------------------------------
+dow = dayofweek(time, sessTz)
+dowLong  = (dow == 2 and monLong)  or (dow == 3 and tueLong)  or (dow == 4 and wedLong)  or (dow == 5 and thuLong)  or (dow == 6 and friLong)
+dowShort = (dow == 2 and monShort) or (dow == 3 and tueShort) or (dow == 4 and wedShort) or (dow == 5 and thuShort) or (dow == 6 and friShort)
+canTakeLong  = tradeLongs  and dowLong
+canTakeShort = tradeShorts and dowShort
+
+// -----------------------------------------------------------------------------
+// Entry cutoff
+// -----------------------------------------------------------------------------
+hourMin    = hour(time, sessTz) * 60 + minute(time, sessTz)
+cutoffMin  = cutoffHour * 60 + cutoffMinute
+pastCutoff = useCutoff and hourMin >= cutoffMin
 
 // -----------------------------------------------------------------------------
 // IB tracking
@@ -150,6 +193,12 @@ dnL4 = ibLocked ? ibLow - ibRange * m4 : na
 dnL5 = ibLocked ? ibLow - ibRange * m5 : na
 
 // -----------------------------------------------------------------------------
+// Retracement entry / stop levels
+// -----------------------------------------------------------------------------
+retraceLongEntry  = ibLocked ? ibHigh - ibRange * retracePct / 100.0 : na
+retraceShortEntry = ibLocked ? ibLow  + ibRange * retracePct / 100.0 : na
+
+// -----------------------------------------------------------------------------
 // Day classification state (break tracking runs AFTER entry arming below so
 // a first-post-IB bar that already exceeds the IB can still arm the entry)
 // -----------------------------------------------------------------------------
@@ -167,12 +216,14 @@ if rthStart
 // -----------------------------------------------------------------------------
 // Stop loss anchors
 // -----------------------------------------------------------------------------
-longStopPx  = stopType == "IB Opposite" ? ibLow  :
-              stopType == "IB Mid"      ? ibMid  :
-                                          ibHigh - ibRange * stopPctIB
-shortStopPx = stopType == "IB Opposite" ? ibHigh :
-              stopType == "IB Mid"      ? ibMid  :
-                                          ibLow  + ibRange * stopPctIB
+longStopPx  = stopType == "IB Opposite"    ? ibLow  :
+              stopType == "IB Mid"         ? ibMid  :
+              stopType == "IB Retracement" ? ibHigh - ibRange * stopRetracePct / 100.0 :
+                                             ibHigh - ibRange * stopPctIB
+shortStopPx = stopType == "IB Opposite"    ? ibHigh :
+              stopType == "IB Mid"         ? ibMid  :
+              stopType == "IB Retracement" ? ibLow  + ibRange * stopRetracePct / 100.0 :
+                                             ibLow  + ibRange * stopPctIB
 
 // -----------------------------------------------------------------------------
 // Range filter
@@ -183,24 +234,35 @@ rangeOK    = ibLocked and ibRangePct >= minIBRangePct and ibRangePct <= maxIBRan
 // -----------------------------------------------------------------------------
 // EOD time guard
 // -----------------------------------------------------------------------------
-hourMin    = hour(time, sessTz) * 60 + minute(time, sessTz)
 closeMin   = 16 * 60 - exitMinsBefore
 flattenEOD = inRTH and hourMin >= closeMin
 
 // -----------------------------------------------------------------------------
-// Entry orders (OCA stop entries armed once IB is locked)
+// Entry orders
 // -----------------------------------------------------------------------------
-canArm = ibLocked and inRTH and not doubleBreak and rangeOK and not flattenEOD and strategy.position_size == 0
+canArm = ibLocked and inRTH and not doubleBreak and rangeOK and not flattenEOD and not pastCutoff and strategy.position_size == 0
 
 if canArm
-    if tradeLongs and not brokeAbove
-        strategy.entry("L", strategy.long, stop = ibHigh,
-             oca_name = "IB_BR", oca_type = strategy.oca.cancel,
-             comment  = "Breakout")
-    if tradeShorts and not brokeBelow
-        strategy.entry("S", strategy.short, stop = ibLow,
-             oca_name = "IB_BR", oca_type = strategy.oca.cancel,
-             comment  = "Breakdown")
+    if useRetrace
+        // Retracement mode: limit entry AFTER breakout confirmation
+        if canTakeLong and brokeAbove
+            strategy.entry("L", strategy.long, limit = retraceLongEntry,
+                 oca_name = "IB_BR", oca_type = strategy.oca.cancel,
+                 comment  = "Retrace Long")
+        if canTakeShort and brokeBelow
+            strategy.entry("S", strategy.short, limit = retraceShortEntry,
+                 oca_name = "IB_BR", oca_type = strategy.oca.cancel,
+                 comment  = "Retrace Short")
+    else
+        // Breakout mode: stop entries at IB edge
+        if canTakeLong and not brokeAbove
+            strategy.entry("L", strategy.long, stop = ibHigh,
+                 oca_name = "IB_BR", oca_type = strategy.oca.cancel,
+                 comment  = "Breakout")
+        if canTakeShort and not brokeBelow
+            strategy.entry("S", strategy.short, stop = ibLow,
+                 oca_name = "IB_BR", oca_type = strategy.oca.cancel,
+                 comment  = "Breakdown")
 
 // Cancel pending entry on the unused side as soon as we are filled
 if strategy.position_size > 0
@@ -208,9 +270,14 @@ if strategy.position_size > 0
 if strategy.position_size < 0
     strategy.cancel("L")
 
+// Cancel entries once past cutoff (if still flat)
+if pastCutoff and strategy.position_size == 0
+    strategy.cancel("L")
+    strategy.cancel("S")
+
 // -----------------------------------------------------------------------------
 // Break tracking (runs AFTER entry arming so the first post-IB bar can still
-// arm its entry even when its own high/low already crosses the IB level)
+// arm its breakout entry even when its own high/low already crosses the IB level)
 // -----------------------------------------------------------------------------
 if ibLocked and inRTH
     if high > ibHigh
@@ -293,6 +360,18 @@ plot(showIB and ibLocked ? ibLow : na, "IB Low",
 plot(showIB and ibLocked ? ibMid : na, "IB Mid",
      color = color.new(color.gray, 0), linewidth = 1, style = plot.style_linebr)
 
+// Retracement entry levels (only shown after breakout, before fill)
+plot(showRetrace and useRetrace and ibLocked and brokeAbove and strategy.position_size == 0 ? retraceLongEntry : na,
+     "Retrace Long Entry", color = color.new(color.aqua, 50), linewidth = 1, style = plot.style_linebr)
+plot(showRetrace and useRetrace and ibLocked and brokeBelow and strategy.position_size == 0 ? retraceShortEntry : na,
+     "Retrace Short Entry", color = color.new(color.fuchsia, 50), linewidth = 1, style = plot.style_linebr)
+
+// Retracement stop levels
+plot(showRetrace and stopType == "IB Retracement" and ibLocked and strategy.position_size > 0 ? longStopPx : na,
+     "Retrace Long Stop", color = color.new(color.red, 60), linewidth = 1, style = plot.style_cross)
+plot(showRetrace and stopType == "IB Retracement" and ibLocked and strategy.position_size < 0 ? shortStopPx : na,
+     "Retrace Short Stop", color = color.new(color.red, 60), linewidth = 1, style = plot.style_cross)
+
 plot(showTargets and useT1 and ibLocked ? upL1 : na, "+0.2",
      color = color.new(color.lime, 20), style = plot.style_linebr)
 plot(showTargets and useT2 and ibLocked ? upL2 : na, "+0.4",
@@ -316,6 +395,8 @@ plot(showTargets and useT5 and ibLocked ? dnL5 : na, "-1.0",
      color = color.new(color.red, 70), style = plot.style_linebr)
 
 bgcolor(doubleBreak ? color.new(color.orange, 90) : na, title = "Double Break Highlight")
+bgcolor(pastCutoff and inRTH and ibLocked and strategy.position_size == 0 ? color.new(color.gray, 95) : na,
+     title = "Past Cutoff (No New Entries)")
 
 // -----------------------------------------------------------------------------
 // Probability labels at IB completion
