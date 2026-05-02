@@ -5,10 +5,12 @@
 //
 // Concept
 //   * IB = high/low of the first hour of RTH (configurable).
-//   * After IB completes, two stop entries are armed (OCA-like behavior):
-//        - Long  stop at IB high  (breakout)
-//        - Short stop at IB low   (breakdown)
-//     Whichever fills first becomes the trade; the other is canceled.
+//   * After IB completes, stop entries are armed per tier (OCA-like behavior):
+//        - Long  stops at IB high  (breakout)  — one per active tier
+//        - Short stops at IB low   (breakdown)  — one per active tier
+//     Whichever SIDE fills first becomes the trade; the other side is canceled.
+//   * Each tier entry gets its own paired bracket (limit target + stop loss).
+//     This ensures contracts scale out correctly across all 5 extension levels.
 //   * If price later violates the OPPOSITE side of the IB, the day is
 //     reclassified as a "double break" and the position is flattened.
 //   * Scaled exits at IB-range extensions: 0.2 / 0.4 / 0.6 / 0.8 / 1.0 x IB.
@@ -56,6 +58,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             CustomIBMult
         }
 
+        // Pre-computed signal names to avoid per-tick string allocation
+        private static readonly string[] LN  = { "L1", "L2", "L3", "L4", "L5" };
+        private static readonly string[] SN  = { "S1", "S2", "S3", "S4", "S5" };
+        private static readonly string[] XLN = { "XL1", "XL2", "XL3", "XL4", "XL5" };
+        private static readonly string[] SLN = { "SL1", "SL2", "SL3", "SL4", "SL5" };
+        private static readonly string[] XSN = { "XS1", "XS2", "XS3", "XS4", "XS5" };
+        private static readonly string[] SSN = { "SS1", "SS2", "SS3", "SS4", "SS5" };
+
         // ---- Runtime state ----
         private double ibHigh;
         private double ibLow;
@@ -71,14 +81,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double longStopPx;
         private double shortStopPx;
 
-        private double upL1, upL2, upL3, upL4, upL5;
-        private double dnL1, dnL2, dnL3, dnL4, dnL5;
+        private double[] upTgt;
+        private double[] dnTgt;
+        private int[]    tierQty;
 
-        private int    initialQty;
         private double entryPrice;
 
-        private Order longEntryOrder;
-        private Order shortEntryOrder;
+        private Order[] longEntryOrders;
+        private Order[] shortEntryOrders;
 
         private int    ibFinishBarIndex;
         private string sessionTag;
@@ -90,11 +100,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Description                 = "IB Breakout Extension Strategy — scaled exits at IB-range extensions. "
-                    + "Set IB/RTH hours to match your chart's timezone.";
+                    + "Uses per-tier sub-entries so each tier bracket (target + stop) is independent.";
                 Name                        = "IBBreakoutExtensionStrategy";
                 Calculate                   = Calculate.OnEachTick;
-                EntriesPerDirection         = 1;
-                EntryHandling               = EntryHandling.AllEntries;
+                EntriesPerDirection         = 5;
+                EntryHandling               = EntryHandling.UniqueEntries;
                 IsExitOnSessionCloseStrategy = false;
                 ExitOnSessionCloseSeconds   = 30;
                 IsFillLimitOnTouch          = false;
@@ -144,6 +154,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.DataLoaded)
             {
+                upTgt            = new double[5];
+                dnTgt            = new double[5];
+                tierQty          = new int[5];
+                longEntryOrders  = new Order[5];
+                shortEntryOrders = new Order[5];
                 ResetDayState();
                 doubleBreakBrush = new SolidColorBrush(Color.FromArgb(25, 255, 165, 0));
                 doubleBreakBrush.Freeze();
@@ -152,8 +167,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ResetDayState()
         {
-            ibHigh          = 0;
-            ibLow           = 0;
+            ibHigh          = double.MinValue;
+            ibLow           = double.MaxValue;
             ibMid           = 0;
             ibRange         = 0;
             ibLocked        = false;
@@ -161,12 +176,57 @@ namespace NinjaTrader.NinjaScript.Strategies
             brokeBelow      = false;
             doubleBreak     = false;
             beActive        = false;
-            initialQty      = 0;
             entryPrice      = 0;
-            longEntryOrder  = null;
-            shortEntryOrder = null;
             ibFinishBarIndex = 0;
             sessionTag      = "";
+            for (int i = 0; i < 5; i++)
+            {
+                upTgt[i]            = 0;
+                dnTgt[i]            = 0;
+                tierQty[i]          = 0;
+                longEntryOrders[i]  = null;
+                shortEntryOrders[i] = null;
+            }
+        }
+
+        private void ComputeTierQty()
+        {
+            bool[]   use = { UseT1, UseT2, UseT3, UseT4, UseT5 };
+            double[] pct = { Pct1,  Pct2,  Pct3,  Pct4,  Pct5  };
+
+            int total = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                tierQty[i] = use[i] ? (int)Math.Floor(Contracts * pct[i] / 100.0) : 0;
+                total += tierQty[i];
+            }
+
+            int rem = Contracts - total;
+            for (int i = 4; i >= 0 && rem > 0; i--)
+            {
+                if (use[i])
+                {
+                    tierQty[i] += rem;
+                    rem = 0;
+                }
+            }
+        }
+
+        private void CancelAllEntries()
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                if (longEntryOrders[i] != null)
+                {
+                    CancelOrder(longEntryOrders[i]);
+                    longEntryOrders[i] = null;
+                }
+                if (shortEntryOrders[i] != null)
+                {
+                    CancelOrder(shortEntryOrders[i]);
+                    shortEntryOrders[i] = null;
+                }
+            }
         }
 
         protected override void OnBarUpdate()
@@ -179,10 +239,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ResetDayState();
 
             // ---- Time detection (chart-native, no TZ conversion) ----
-            int t    = ToTime(Time[0]);
-            int ibSt = IBStartHour * 10000 + IBStartMinute * 100;
-            int ibEn = IBEndHour   * 10000 + IBEndMinute   * 100;
-            int rthEn = RTHEndHour * 10000 + RTHEndMinute  * 100;
+            int t     = ToTime(Time[0]);
+            int ibSt  = IBStartHour * 10000 + IBStartMinute * 100;
+            int ibEn  = IBEndHour   * 10000 + IBEndMinute   * 100;
+            int rthEn = RTHEndHour  * 10000 + RTHEndMinute  * 100;
 
             bool inIB  = t > ibSt  && t <= ibEn;
             bool inRTH = t > ibSt  && t <= rthEn;
@@ -214,7 +274,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ibLow  = Math.Min(ibLow,  Low[0]);
             }
 
-            if (ibFinish && ibHigh > 0 && ibLow > 0)
+            if (ibFinish && ibHigh > ibLow)
             {
                 ibMid    = (ibHigh + ibLow) / 2.0;
                 ibRange  = ibHigh - ibLow;
@@ -222,19 +282,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ibFinishBarIndex = CurrentBar;
                 sessionTag = Time[0].ToString("yyyyMMdd");
 
-                // Compute targets once at IB lock
-                upL1 = ibHigh + ibRange * Mult1;
-                upL2 = ibHigh + ibRange * Mult2;
-                upL3 = ibHigh + ibRange * Mult3;
-                upL4 = ibHigh + ibRange * Mult4;
-                upL5 = ibHigh + ibRange * Mult5;
-                dnL1 = ibLow  - ibRange * Mult1;
-                dnL2 = ibLow  - ibRange * Mult2;
-                dnL3 = ibLow  - ibRange * Mult3;
-                dnL4 = ibLow  - ibRange * Mult4;
-                dnL5 = ibLow  - ibRange * Mult5;
+                double[] mult = { Mult1, Mult2, Mult3, Mult4, Mult5 };
+                for (int i = 0; i < 5; i++)
+                {
+                    upTgt[i] = ibHigh + ibRange * mult[i];
+                    dnTgt[i] = ibLow  - ibRange * mult[i];
+                }
 
-                // Draw probability labels once at IB completion
+                ComputeTierQty();
+
                 if (ShowStats)
                     DrawProbLabels();
             }
@@ -278,24 +334,45 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool canArm = ibLocked && inRTH && !doubleBreak && rangeOK && !flattenEOD
                           && Position.MarketPosition == MarketPosition.Flat;
 
-            // ---- Entry arming ----
+            // ---- Entry arming: one sub-entry per active tier ----
             if (canArm)
             {
                 if (TradeLongs && !brokeAbove)
-                    EnterLongStopMarket(0, true, Contracts, ibHigh, "L");
+                {
+                    for (int i = 0; i < 5; i++)
+                        if (tierQty[i] > 0)
+                            EnterLongStopMarket(0, true, tierQty[i], ibHigh, LN[i]);
+                }
                 if (TradeShorts && !brokeBelow)
-                    EnterShortStopMarket(0, true, Contracts, ibLow, "S");
+                {
+                    for (int i = 0; i < 5; i++)
+                        if (tierQty[i] > 0)
+                            EnterShortStopMarket(0, true, tierQty[i], ibLow, SN[i]);
+                }
             }
 
-            if (Position.MarketPosition == MarketPosition.Long && shortEntryOrder != null)
+            // ---- OCA emulation: cancel opposite side on fill ----
+            if (Position.MarketPosition == MarketPosition.Long)
             {
-                CancelOrder(shortEntryOrder);
-                shortEntryOrder = null;
+                for (int i = 0; i < 5; i++)
+                {
+                    if (shortEntryOrders[i] != null)
+                    {
+                        CancelOrder(shortEntryOrders[i]);
+                        shortEntryOrders[i] = null;
+                    }
+                }
             }
-            if (Position.MarketPosition == MarketPosition.Short && longEntryOrder != null)
+            if (Position.MarketPosition == MarketPosition.Short)
             {
-                CancelOrder(longEntryOrder);
-                longEntryOrder = null;
+                for (int i = 0; i < 5; i++)
+                {
+                    if (longEntryOrders[i] != null)
+                    {
+                        CancelOrder(longEntryOrders[i]);
+                        longEntryOrders[i] = null;
+                    }
+                }
             }
 
             // ---- Break tracking (AFTER entry arming) ----
@@ -307,80 +384,102 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (doubleBreak)
-            {
-                if (longEntryOrder != null)  { CancelOrder(longEntryOrder);  longEntryOrder  = null; }
-                if (shortEntryOrder != null) { CancelOrder(shortEntryOrder); shortEntryOrder = null; }
-            }
+                CancelAllEntries();
 
             // ---- Breakeven trigger detection ----
             if (UseBreakeven && !beActive && Position.MarketPosition != MarketPosition.Flat)
             {
-                double bePxLong  = BETier == 1 ? upL1 : BETier == 2 ? upL2 : BETier == 3 ? upL3 : BETier == 4 ? upL4 : upL5;
-                double bePxShort = BETier == 1 ? dnL1 : BETier == 2 ? dnL2 : BETier == 3 ? dnL3 : BETier == 4 ? dnL4 : dnL5;
-                if (Position.MarketPosition == MarketPosition.Long  && High[0] >= bePxLong)  beActive = true;
-                if (Position.MarketPosition == MarketPosition.Short && Low[0]  <= bePxShort) beActive = true;
+                int bi = BETier - 1;
+                if (bi >= 0 && bi < 5)
+                {
+                    if (Position.MarketPosition == MarketPosition.Long  && High[0] >= upTgt[bi])
+                        beActive = true;
+                    if (Position.MarketPosition == MarketPosition.Short && Low[0]  <= dnTgt[bi])
+                        beActive = true;
+                }
             }
 
             double activeLongStop  = (UseBreakeven && beActive && entryPrice > 0) ? entryPrice : longStopPx;
             double activeShortStop = (UseBreakeven && beActive && entryPrice > 0) ? entryPrice : shortStopPx;
 
-            // ---- Forced exits: double break + EOD ----
+            // ---- Forced exits: double break ----
             if (FlattenOnDouble && doubleBreak && Position.MarketPosition != MarketPosition.Flat)
             {
-                if (Position.MarketPosition == MarketPosition.Long)  ExitLong("DoubleBreakL",  "L");
-                if (Position.MarketPosition == MarketPosition.Short) ExitShort("DoubleBreakS", "S");
+                for (int i = 0; i < 5; i++)
+                {
+                    if (tierQty[i] > 0)
+                    {
+                        if (Position.MarketPosition == MarketPosition.Long)
+                            ExitLong("DBL" + (i + 1), LN[i]);
+                        else
+                            ExitShort("DBS" + (i + 1), SN[i]);
+                    }
+                }
                 return;
             }
 
-            if (flattenEOD && Position.MarketPosition != MarketPosition.Flat)
+            // ---- Forced exits: EOD ----
+            if (flattenEOD)
             {
-                if (Position.MarketPosition == MarketPosition.Long)  ExitLong("EODL",  "L");
-                if (Position.MarketPosition == MarketPosition.Short) ExitShort("EODS", "S");
-                return;
+                CancelAllEntries();
+                if (Position.MarketPosition != MarketPosition.Flat)
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        if (tierQty[i] > 0)
+                        {
+                            if (Position.MarketPosition == MarketPosition.Long)
+                                ExitLong("EODL" + (i + 1), LN[i]);
+                            else
+                                ExitShort("EODS" + (i + 1), SN[i]);
+                        }
+                    }
+                    return;
+                }
             }
 
+            // ---- RTH finish: cancel entries + safety flatten ----
             if (rthFinish)
             {
-                if (longEntryOrder != null)  { CancelOrder(longEntryOrder);  longEntryOrder  = null; }
-                if (shortEntryOrder != null) { CancelOrder(shortEntryOrder); shortEntryOrder = null; }
+                CancelAllEntries();
+                if (Position.MarketPosition != MarketPosition.Flat)
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        if (tierQty[i] > 0)
+                        {
+                            if (Position.MarketPosition == MarketPosition.Long)
+                                ExitLong("RTHL" + (i + 1), LN[i]);
+                            else
+                                ExitShort("RTHS" + (i + 1), SN[i]);
+                        }
+                    }
+                }
+                return;
             }
 
-            // ---- Scaled exits ----
-            if (Position.MarketPosition == MarketPosition.Long && initialQty > 0)
+            // ---- Scaled exits: paired limit + stop per sub-entry ----
+            if (Position.MarketPosition == MarketPosition.Long)
             {
-                int q1 = TierQty(initialQty, Pct1);
-                int q2 = TierQty(initialQty, Pct2);
-                int q3 = TierQty(initialQty, Pct3);
-                int q4 = TierQty(initialQty, Pct4);
-                int q5 = TierQty(initialQty, Pct5);
-
-                if (UseT1 && q1 > 0) ExitLongLimit(0, true, q1, upL1, "X1L", "L");
-                if (UseT2 && q2 > 0) ExitLongLimit(0, true, q2, upL2, "X2L", "L");
-                if (UseT3 && q3 > 0) ExitLongLimit(0, true, q3, upL3, "X3L", "L");
-                if (UseT4 && q4 > 0) ExitLongLimit(0, true, q4, upL4, "X4L", "L");
-                if (UseT5 && q5 > 0) ExitLongLimit(0, true, q5, upL5, "X5L", "L");
-
-                int remaining = Math.Abs(Position.Quantity);
-                if (remaining > 0)
-                    ExitLongStopMarket(0, true, remaining, activeLongStop, "StopL", "L");
+                for (int i = 0; i < 5; i++)
+                {
+                    if (tierQty[i] > 0)
+                    {
+                        ExitLongLimit(0, true, tierQty[i], upTgt[i], XLN[i], LN[i]);
+                        ExitLongStopMarket(0, true, tierQty[i], activeLongStop, SLN[i], LN[i]);
+                    }
+                }
             }
-            else if (Position.MarketPosition == MarketPosition.Short && initialQty > 0)
+            else if (Position.MarketPosition == MarketPosition.Short)
             {
-                int q1 = TierQty(initialQty, Pct1);
-                int q2 = TierQty(initialQty, Pct2);
-                int q3 = TierQty(initialQty, Pct3);
-                int q4 = TierQty(initialQty, Pct4);
-                int q5 = TierQty(initialQty, Pct5);
-
-                if (UseT1 && q1 > 0) ExitShortLimit(0, true, q1, dnL1, "X1S", "S");
-                if (UseT2 && q2 > 0) ExitShortLimit(0, true, q2, dnL2, "X2S", "S");
-                if (UseT3 && q3 > 0) ExitShortLimit(0, true, q3, dnL3, "X3S", "S");
-                if (UseT4 && q4 > 0) ExitShortLimit(0, true, q4, dnL4, "X4S", "S");
-                if (UseT5 && q5 > 0) ExitShortLimit(0, true, q5, dnL5, "X5S", "S");
-
-                int remaining = Math.Abs(Position.Quantity);
-                if (remaining > 0)
-                    ExitShortStopMarket(0, true, remaining, activeShortStop, "StopS", "S");
+                for (int i = 0; i < 5; i++)
+                {
+                    if (tierQty[i] > 0)
+                    {
+                        ExitShortLimit(0, true, tierQty[i], dnTgt[i], XSN[i], SN[i]);
+                        ExitShortStopMarket(0, true, tierQty[i], activeShortStop, SSN[i], SN[i]);
+                    }
+                }
             }
 
             // ---- Visualization (once per bar for performance) ----
@@ -403,37 +502,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (UseT1)
                     {
-                        Draw.Line(this, "U1" + sessionTag, false, bb, upL1, 0, upL1,
+                        Draw.Line(this, "U1" + sessionTag, false, bb, upTgt[0], 0, upTgt[0],
                             Brushes.Lime, DashStyleHelper.Dot, 1);
-                        Draw.Line(this, "D1" + sessionTag, false, bb, dnL1, 0, dnL1,
+                        Draw.Line(this, "D1" + sessionTag, false, bb, dnTgt[0], 0, dnTgt[0],
                             Brushes.Red, DashStyleHelper.Dot, 1);
                     }
                     if (UseT2)
                     {
-                        Draw.Line(this, "U2" + sessionTag, false, bb, upL2, 0, upL2,
+                        Draw.Line(this, "U2" + sessionTag, false, bb, upTgt[1], 0, upTgt[1],
                             Brushes.Lime, DashStyleHelper.Dot, 1);
-                        Draw.Line(this, "D2" + sessionTag, false, bb, dnL2, 0, dnL2,
+                        Draw.Line(this, "D2" + sessionTag, false, bb, dnTgt[1], 0, dnTgt[1],
                             Brushes.Red, DashStyleHelper.Dot, 1);
                     }
                     if (UseT3)
                     {
-                        Draw.Line(this, "U3" + sessionTag, false, bb, upL3, 0, upL3,
+                        Draw.Line(this, "U3" + sessionTag, false, bb, upTgt[2], 0, upTgt[2],
                             Brushes.LimeGreen, DashStyleHelper.Dot, 1);
-                        Draw.Line(this, "D3" + sessionTag, false, bb, dnL3, 0, dnL3,
+                        Draw.Line(this, "D3" + sessionTag, false, bb, dnTgt[2], 0, dnTgt[2],
                             Brushes.OrangeRed, DashStyleHelper.Dot, 1);
                     }
                     if (UseT4)
                     {
-                        Draw.Line(this, "U4" + sessionTag, false, bb, upL4, 0, upL4,
+                        Draw.Line(this, "U4" + sessionTag, false, bb, upTgt[3], 0, upTgt[3],
                             Brushes.LimeGreen, DashStyleHelper.Dot, 1);
-                        Draw.Line(this, "D4" + sessionTag, false, bb, dnL4, 0, dnL4,
+                        Draw.Line(this, "D4" + sessionTag, false, bb, dnTgt[3], 0, dnTgt[3],
                             Brushes.OrangeRed, DashStyleHelper.Dot, 1);
                     }
                     if (UseT5)
                     {
-                        Draw.Line(this, "U5" + sessionTag, false, bb, upL5, 0, upL5,
+                        Draw.Line(this, "U5" + sessionTag, false, bb, upTgt[4], 0, upTgt[4],
                             Brushes.DarkGreen, DashStyleHelper.Dot, 1);
-                        Draw.Line(this, "D5" + sessionTag, false, bb, dnL5, 0, dnL5,
+                        Draw.Line(this, "D5" + sessionTag, false, bb, dnTgt[4], 0, dnTgt[4],
                             Brushes.DarkRed, DashStyleHelper.Dot, 1);
                     }
                 }
@@ -444,11 +543,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ---- Helpers ----
-        private static int TierQty(int total, double pct)
-        {
-            int q = (int)Math.Floor(total * pct / 100.0);
-            return q < 0 ? 0 : q;
-        }
 
         private double GetProb(int idx)
         {
@@ -466,30 +560,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void DrawProbLabels()
         {
             string s = sessionTag;
-            if (UseT1)
+            string[] upStr = { "+0.2", "+0.4", "+0.6", "+0.8", "+1.0" };
+            string[] dnStr = { "-0.2", "-0.4", "-0.6", "-0.8", "-1.0" };
+            Brush[]  upBr  = { Brushes.Lime, Brushes.Lime, Brushes.LimeGreen, Brushes.LimeGreen, Brushes.DarkGreen };
+            Brush[]  dnBr  = { Brushes.Red,  Brushes.Red,  Brushes.OrangeRed, Brushes.OrangeRed, Brushes.DarkRed   };
+            bool[]   use   = { UseT1, UseT2, UseT3, UseT4, UseT5 };
+
+            for (int i = 0; i < 5; i++)
             {
-                Draw.Text(this, "PU1" + s, "+0.2  " + GetProb(0).ToString("0.#") + "%", 0, upL1, Brushes.Lime);
-                Draw.Text(this, "PD1" + s, "-0.2  " + GetProb(0).ToString("0.#") + "%", 0, dnL1, Brushes.Red);
-            }
-            if (UseT2)
-            {
-                Draw.Text(this, "PU2" + s, "+0.4  " + GetProb(1).ToString("0.#") + "%", 0, upL2, Brushes.Lime);
-                Draw.Text(this, "PD2" + s, "-0.4  " + GetProb(1).ToString("0.#") + "%", 0, dnL2, Brushes.Red);
-            }
-            if (UseT3)
-            {
-                Draw.Text(this, "PU3" + s, "+0.6  " + GetProb(2).ToString("0.#") + "%", 0, upL3, Brushes.LimeGreen);
-                Draw.Text(this, "PD3" + s, "-0.6  " + GetProb(2).ToString("0.#") + "%", 0, dnL3, Brushes.OrangeRed);
-            }
-            if (UseT4)
-            {
-                Draw.Text(this, "PU4" + s, "+0.8  " + GetProb(3).ToString("0.#") + "%", 0, upL4, Brushes.LimeGreen);
-                Draw.Text(this, "PD4" + s, "-0.8  " + GetProb(3).ToString("0.#") + "%", 0, dnL4, Brushes.OrangeRed);
-            }
-            if (UseT5)
-            {
-                Draw.Text(this, "PU5" + s, "+1.0  " + GetProb(4).ToString("0.#") + "%", 0, upL5, Brushes.DarkGreen);
-                Draw.Text(this, "PD5" + s, "-1.0  " + GetProb(4).ToString("0.#") + "%", 0, dnL5, Brushes.DarkRed);
+                if (use[i])
+                {
+                    string prob = GetProb(i).ToString("0.#") + "%";
+                    Draw.Text(this, "PU" + (i + 1) + s, upStr[i] + "  " + prob, 0, upTgt[i], upBr[i]);
+                    Draw.Text(this, "PD" + (i + 1) + s, dnStr[i] + "  " + prob, 0, dnTgt[i], dnBr[i]);
+                }
             }
         }
 
@@ -497,17 +581,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity,
             int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
         {
-            if (order.Name == "L" && order.OrderState == OrderState.Working)
-                longEntryOrder = order;
-            if (order.Name == "S" && order.OrderState == OrderState.Working)
-                shortEntryOrder = order;
-
-            if (order.Name == "L" && (order.OrderState == OrderState.Cancelled || order.OrderState == OrderState.Filled
-                || order.OrderState == OrderState.Rejected))
-                if (order == longEntryOrder) longEntryOrder = null;
-            if (order.Name == "S" && (order.OrderState == OrderState.Cancelled || order.OrderState == OrderState.Filled
-                || order.OrderState == OrderState.Rejected))
-                if (order == shortEntryOrder) shortEntryOrder = null;
+            for (int i = 0; i < 5; i++)
+            {
+                if (order.Name == LN[i])
+                {
+                    if (order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted)
+                        longEntryOrders[i] = order;
+                    if (order.OrderState == OrderState.Cancelled || order.OrderState == OrderState.Filled
+                        || order.OrderState == OrderState.Rejected)
+                        longEntryOrders[i] = null;
+                }
+                if (order.Name == SN[i])
+                {
+                    if (order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted)
+                        shortEntryOrders[i] = order;
+                    if (order.OrderState == OrderState.Cancelled || order.OrderState == OrderState.Filled
+                        || order.OrderState == OrderState.Rejected)
+                        shortEntryOrders[i] = null;
+                }
+            }
         }
 
         protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity,
@@ -517,18 +609,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (execution.Order.OrderState != OrderState.Filled && execution.Order.OrderState != OrderState.PartFilled)
                 return;
 
-            if (execution.Order.Name == "L" || execution.Order.Name == "S")
+            string name = execution.Order.Name;
+            bool isEntry = false;
+            for (int i = 0; i < 5; i++)
             {
-                if (Position.MarketPosition != MarketPosition.Flat)
+                if (name == LN[i] || name == SN[i])
                 {
-                    initialQty = Math.Abs(Position.Quantity);
-                    entryPrice = Position.AveragePrice;
+                    isEntry = true;
+                    break;
                 }
             }
 
+            if (isEntry && Position.MarketPosition != MarketPosition.Flat)
+                entryPrice = Position.AveragePrice;
+
             if (Position.MarketPosition == MarketPosition.Flat)
             {
-                initialQty = 0;
                 entryPrice = 0;
                 beActive   = false;
             }
