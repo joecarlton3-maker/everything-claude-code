@@ -11,6 +11,7 @@ from typing import Literal
 
 Preset = Literal["Auto", "Custom", "Scalping", "Default", "Swing", "Crypto 24/7"]
 TpMode = Literal["Fixed", "Dynamic"]
+ExitMode = Literal["three_target", "single_target"]
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,11 @@ class SatsConfig:
     tp1_r: float = 1.0
     tp2_r: float = 2.0
     tp3_r: float = 3.0
+
+    # Exit engine
+    #   "three_target"  → numba simulator, 1/3-1/3-1/3 scale-out at TP1/TP2/TP3 (Pine default)
+    #   "single_target" → vectorbt Portfolio.from_signals, full close at TP1 (TP2/TP3 ignored)
+    exit_mode: ExitMode = "three_target"
 
     # Dynamic TP
     dyn_tp_tqi_weight: float = 0.6
