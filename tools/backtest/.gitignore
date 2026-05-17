@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Data cache (large, regeneratable)
+data_cache/
+*.parquet
+*.feather
+
+# Backtest outputs
+reports/
+*.html
+equity_*.png
+
+# Secrets
+.env
+.env.local
