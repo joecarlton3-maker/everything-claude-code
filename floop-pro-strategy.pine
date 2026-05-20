@@ -7,21 +7,7 @@
 // Exits use ATR-based stop-loss and take-profit (RR multiple).
 
 //@version=5
-strategy("FLOOP Pro Strategy",
-     shorttitle           = "FLOOP STRAT",
-     overlay              = true,
-     max_lines_count      = 500,
-     max_labels_count     = 500,
-     max_boxes_count      = 200,
-     pyramiding           = 0,
-     initial_capital      = 10000,
-     default_qty_type     = strategy.percent_of_equity,
-     default_qty_value    = 10,
-     commission_type      = strategy.commission.percent,
-     commission_value     = 0.05,
-     slippage             = 2,
-     process_orders_on_close = true,
-     calc_on_every_tick   = false)
+strategy("FLOOP Pro Strategy", shorttitle="FLOOP STRAT", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200, pyramiding=0, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05, slippage=2, process_orders_on_close=true, calc_on_every_tick=false)
 
 // ▌ INPUTS ─────────────────────────────────────────────────────────────────
 grp_pvt = "── Pivot Levels ──"
