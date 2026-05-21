@@ -1,0 +1,125 @@
+//@version=5
+strategy("EMA(5)/SMMA(5) Crossover — Multi-TF Strategy",
+     overlay              = true,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 100,
+     pyramiding           = 0,
+     calc_on_every_tick   = false,
+     process_orders_on_close = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ─────────────────────────── Inputs ───────────────────────────
+emaLen   = input.int(5,  "EMA Length",  minval = 1, group = "Signal MAs")
+smmaLen  = input.int(5,  "SMMA Length", minval = 1, group = "Signal MAs")
+
+rsiLen   = input.int(14, "RSI Length",  minval = 2, group = "Filters")
+rsiMid   = input.int(50, "RSI Midline",              group = "Filters")
+bbLen    = input.int(20, "BB Length",   minval = 2, group = "Filters")
+bbMult   = input.float(2.0,"BB StdDev", step = 0.1, group = "Filters")
+
+htf      = input.timeframe("5", "Higher Timeframe for Trend", group = "Trend (HTF)")
+adxLen   = input.int(14, "ADX/DMI Length", minval = 1,        group = "Trend (HTF)")
+adxTh    = input.float(20, "ADX Trending Threshold", step = 1, group = "Trend (HTF)")
+
+rrSide   = input.float(1.0, "R:R when HTF Sideways", step = 0.1, group = "Risk")
+rrTrend  = input.float(2.0, "R:R when HTF Trending", step = 0.1, group = "Risk")
+
+useSess  = input.bool(true, "Restrict to Trading Window", group = "Session")
+sessStr  = input.session("0930-1130", "Trading Window",  group = "Session")
+sessTz   = input.string("America/New_York", "Session Timezone", group = "Session")
+flatEOD  = input.bool(true, "Force-flat at end of window", group = "Session")
+
+// ─────────────────────────── 1-min signal logic ───────────────────────────
+emaLine   = ta.ema(close, emaLen)
+smmaLine  = ta.rma(close, smmaLen)            // ta.rma = SMMA
+rsiVal    = ta.rsi(close, rsiLen)
+
+bbBasis   = ta.sma(close, bbLen)
+bbDev     = bbMult * ta.stdev(close, bbLen)
+bbUpper   = bbBasis + bbDev
+bbLower   = bbBasis - bbDev
+bbSlopeUp = bbBasis > bbBasis[1]
+bbSlopeDn = bbBasis < bbBasis[1]
+
+crossUp   = ta.crossover(emaLine,  smmaLine)
+crossDn   = ta.crossunder(emaLine, smmaLine)
+
+// ─────────────────────────── HTF trend classification ───────────────────────────
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+[htfDiPlus, htfDiMinus, htfAdx] = request.security(
+     syminfo.tickerid, htf,
+     [diPlus, diMinus, adx],
+     lookahead = barmerge.lookahead_off)
+
+isTrendingUp   = htfAdx >= adxTh and htfDiPlus  > htfDiMinus
+isTrendingDown = htfAdx >= adxTh and htfDiMinus > htfDiPlus
+isSideways     = htfAdx <  adxTh
+isTrending     = isTrendingUp or isTrendingDown
+
+// ─────────────────────────── Trading window ───────────────────────────
+inSession = not useSess or not na(time(timeframe.period, sessStr, sessTz))
+
+// ─────────────────────────── Entry conditions ───────────────────────────
+longSetup  = crossUp and rsiVal > rsiMid and bbSlopeUp
+shortSetup = crossDn and rsiVal < rsiMid and bbSlopeDn
+
+canLong    = inSession and (isSideways or isTrendingUp)
+canShort   = inSession and (isSideways or isTrendingDown)
+
+doLong     = longSetup  and canLong
+doShort    = shortSetup and canShort
+
+// ─────────────────────────── Stops & targets ───────────────────────────
+var float longStop  = na
+var float longTP    = na
+var float shortStop = na
+var float shortTP   = na
+
+if doLong
+    sl    = low[1]                                  // low of bar before crossover
+    risk  = close - sl
+    rr    = isTrending ? rrTrend : rrSide
+    if risk > 0
+        longStop := sl
+        longTP   := close + risk * rr
+        strategy.entry("Long", strategy.long)
+
+if doShort
+    sl    = high[1]                                 // high of bar before crossover
+    risk  = sl - close
+    rr    = isTrending ? rrTrend : rrSide
+    if risk > 0
+        shortStop := sl
+        shortTP   := close - risk * rr
+        strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0
+    strategy.exit("X Long",  from_entry = "Long",  stop = longStop,  limit = longTP)
+
+if strategy.position_size < 0
+    strategy.exit("X Short", from_entry = "Short", stop = shortStop, limit = shortTP)
+
+// Force-flat when the trading window closes
+if flatEOD and useSess and not inSession and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat")
+
+// ─────────────────────────── Plots ───────────────────────────
+plot(emaLine,  "EMA 5",   color = color.orange,                 linewidth = 2)
+plot(smmaLine, "SMMA 5",  color = color.blue,                   linewidth = 2)
+plot(bbBasis,  "BB Basis",color = color.new(color.gray, 30))
+pU = plot(bbUpper, "BB Upper", color = color.new(color.gray, 70))
+pL = plot(bbLower, "BB Lower", color = color.new(color.gray, 70))
+fill(pU, pL, color = color.new(color.gray, 92))
+
+plotshape(doLong,  title = "Long Entry",  location = location.belowbar, style = shape.labelup,   color = color.new(color.green, 0), textcolor = color.white, text = "L", size = size.tiny)
+plotshape(doShort, title = "Short Entry", location = location.abovebar, style = shape.labeldown, color = color.new(color.red,   0), textcolor = color.white, text = "S", size = size.tiny)
+
+bgcolor(isTrendingUp   ? color.new(color.green, 92) : na, title = "HTF Up")
+bgcolor(isTrendingDown ? color.new(color.red,   92) : na, title = "HTF Down")
+bgcolor(useSess and not inSession ? color.new(color.gray, 88) : na, title = "Out of Window")
+
+// ─────────────────────────── Alerts ───────────────────────────
+alertcondition(doLong,  title = "Strategy Long Signal",  message = "LONG {{ticker}} {{interval}} @ {{close}}")
+alertcondition(doShort, title = "Strategy Short Signal", message = "SHORT {{ticker}} {{interval}} @ {{close}}")
