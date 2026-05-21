@@ -19,9 +19,11 @@ rsiMid   = input.int(50, "RSI Midline",              group = "Filters")
 bbLen    = input.int(20, "BB Length",   minval = 2, group = "Filters")
 bbMult   = input.float(2.0,"BB StdDev", step = 0.1, group = "Filters")
 
-htf      = input.timeframe("5", "Higher Timeframe for Trend", group = "Trend (HTF)")
-adxLen   = input.int(14, "ADX/DMI Length", minval = 1,        group = "Trend (HTF)")
-adxTh    = input.float(20, "ADX Trending Threshold", step = 1, group = "Trend (HTF)")
+htf       = input.timeframe("5", "Higher Timeframe for Trend", group = "Trend (HTF)")
+trendMaLen = input.int(20, "HTF Trend SMA Length", minval = 2, group = "Trend (HTF)")
+slopeLook  = input.int(3,  "Slope Lookback (HTF bars)", minval = 1, group = "Trend (HTF)")
+slopeAtrK  = input.float(0.10, "Slope Threshold (× ATR)", step = 0.01, group = "Trend (HTF)",
+     tooltip = "Trend qualifies as up/down when |SMA - SMA[N]| > k × ATR(N). Smaller = more trending bars.")
 
 rrSide   = input.float(1.0, "R:R when HTF Sideways", step = 0.1, group = "Risk")
 rrTrend  = input.float(2.0, "R:R when HTF Trending", step = 0.1, group = "Risk")
@@ -47,15 +49,18 @@ crossUp   = ta.crossover(emaLine,  smmaLine)
 crossDn   = ta.crossunder(emaLine, smmaLine)
 
 // ─────────────────────────── HTF trend classification ───────────────────────────
-[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
-[htfDiPlus, htfDiMinus, htfAdx] = request.security(
-     syminfo.tickerid, htf,
-     [diPlus, diMinus, adx],
-     lookahead = barmerge.lookahead_off)
+// Slope of the 20-period SMA on the 5-min chart, normalised by ATR(N) so the
+// threshold is scale-independent across instruments.
+htfSma    = request.security(syminfo.tickerid, htf, ta.sma(close,  trendMaLen), lookahead = barmerge.lookahead_off)
+htfSmaPrv = request.security(syminfo.tickerid, htf, ta.sma(close,  trendMaLen)[slopeLook], lookahead = barmerge.lookahead_off)
+htfAtr    = request.security(syminfo.tickerid, htf, ta.atr(slopeLook), lookahead = barmerge.lookahead_off)
 
-isTrendingUp   = htfAdx >= adxTh and htfDiPlus  > htfDiMinus
-isTrendingDown = htfAdx >= adxTh and htfDiMinus > htfDiPlus
-isSideways     = htfAdx <  adxTh
+slopeRaw  = htfSma - htfSmaPrv
+slopeThr  = slopeAtrK * htfAtr
+
+isTrendingUp   = slopeRaw >  slopeThr
+isTrendingDown = slopeRaw < -slopeThr
+isSideways     = not isTrendingUp and not isTrendingDown
 isTrending     = isTrendingUp or isTrendingDown
 
 // ─────────────────────────── Trading window ───────────────────────────
@@ -112,6 +117,7 @@ plot(bbBasis,  "BB Basis",color = color.new(color.gray, 30))
 pU = plot(bbUpper, "BB Upper", color = color.new(color.gray, 70))
 pL = plot(bbLower, "BB Lower", color = color.new(color.gray, 70))
 fill(pU, pL, color = color.new(color.gray, 92))
+plot(htfSma, "HTF Trend SMA", color = color.new(color.purple, 0), linewidth = 1)
 
 plotshape(doLong,  title = "Long Entry",  location = location.belowbar, style = shape.labelup,   color = color.new(color.green, 0), textcolor = color.white, text = "L", size = size.tiny)
 plotshape(doShort, title = "Short Entry", location = location.abovebar, style = shape.labeldown, color = color.new(color.red,   0), textcolor = color.white, text = "S", size = size.tiny)
