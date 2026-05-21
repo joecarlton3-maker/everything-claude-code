@@ -1,0 +1,35 @@
+//@version=5
+indicator("RSI (companion to EMA/SMMA Strategy)", precision = 2)
+
+// ─────────────────────────── Inputs ───────────────────────────
+rsiLen = input.int(14, "RSI Length", minval = 2)
+src    = input.source(close, "Source")
+mid    = input.int(50, "Midline")
+ob     = input.int(70, "Overbought")
+os     = input.int(30, "Oversold")
+
+// ─────────────────────────── Calc ───────────────────────────
+rsiVal = ta.rsi(src, rsiLen)
+
+// ─────────────────────────── Plots ───────────────────────────
+plot(rsiVal, "RSI", color = color.new(color.purple, 0), linewidth = 2)
+
+obLine  = hline(ob,  "Overbought",  color = color.new(color.red,   60), linestyle = hline.style_dashed)
+osLine  = hline(os,  "Oversold",    color = color.new(color.green, 60), linestyle = hline.style_dashed)
+midLine = hline(mid, "Midline (50)",color = color.new(color.black,  0), linestyle = hline.style_solid, linewidth = 2)
+
+fill(obLine, osLine, color = color.new(color.purple, 95), title = "RSI Band")
+
+// Tint the pane green when RSI is above 50, red when below
+bgcolor(rsiVal > mid ? color.new(color.green, 92) : color.new(color.red, 92), title = "Side of 50")
+
+// Mark midline crossings (these are the moments the strategy's RSI filter flips)
+midCrossUp = ta.crossover(rsiVal,  mid)
+midCrossDn = ta.crossunder(rsiVal, mid)
+
+plotshape(midCrossUp, title = "RSI > 50", style = shape.triangleup,   location = location.bottom, size = size.tiny, color = color.new(color.green, 0))
+plotshape(midCrossDn, title = "RSI < 50", style = shape.triangledown, location = location.top,    size = size.tiny, color = color.new(color.red,   0))
+
+// ─────────────────────────── Alerts ───────────────────────────
+alertcondition(midCrossUp, title = "RSI crossed above 50", message = "RSI crossed ABOVE 50 on {{ticker}} {{interval}}")
+alertcondition(midCrossDn, title = "RSI crossed below 50", message = "RSI crossed BELOW 50 on {{ticker}} {{interval}}")
