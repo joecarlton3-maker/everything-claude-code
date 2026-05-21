@@ -1,0 +1,29 @@
+//@version=5
+indicator("EMA(5) / SMMA(5) Crossover", overlay = true)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+emaLength  = input.int(5, title = "EMA Length",  minval = 1)
+smmaLength = input.int(5, title = "SMMA Length", minval = 1)
+src        = input.source(close, title = "Source")
+
+// ── Moving averages ─────────────────────────────────────────────────────────
+emaLine  = ta.ema(src, emaLength)
+smmaLine = ta.rma(src, smmaLength)   // ta.rma is the Smoothed Moving Average
+
+// ── Signals ─────────────────────────────────────────────────────────────────
+buySignal  = ta.crossover(emaLine,  smmaLine)
+sellSignal = ta.crossunder(emaLine, smmaLine)
+
+// ── Plotting ────────────────────────────────────────────────────────────────
+plot(emaLine,  title = "EMA 5",  color = color.new(color.orange, 0), linewidth = 2)
+plot(smmaLine, title = "SMMA 5", color = color.new(color.blue,   0), linewidth = 2)
+
+plotshape(buySignal,  title = "Buy",  location = location.belowbar, style = shape.labelup,   color = color.new(color.green, 0), textcolor = color.white, text = "BUY",  size = size.small)
+plotshape(sellSignal, title = "Sell", location = location.abovebar, style = shape.labeldown, color = color.new(color.red,   0), textcolor = color.white, text = "SELL", size = size.small)
+
+bgcolor(buySignal  ? color.new(color.green, 85) : na)
+bgcolor(sellSignal ? color.new(color.red,   85) : na)
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  title = "EMA/SMMA Buy",  message = "EMA(5) crossed ABOVE SMMA(5) on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(sellSignal, title = "EMA/SMMA Sell", message = "EMA(5) crossed BELOW SMMA(5) on {{ticker}} ({{interval}}) @ {{close}}")
