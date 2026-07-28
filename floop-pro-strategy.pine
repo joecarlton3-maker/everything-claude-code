@@ -644,8 +644,8 @@ if i_show_pivots and (barstate.isfirst or new_period)
     line.delete(ln_s3)
     line.delete(ln_s4)
 
-    int left_x  = math.max(0, pvt_start_bar - i_pvt_extend_left)
-    int right_x = bar_index + 12
+    left_x  = math.max(0, pvt_start_bar - i_pvt_extend_left)
+    right_x = bar_index + 12
 
     ln_pp := line.new(left_x, lvl_pp, right_x, lvl_pp, color=c_pvt,       width=2, style=line.style_solid,  extend=extend.none)
     ln_r1 := line.new(left_x, lvl_r1, right_x, lvl_r1, color=c_pvt_r,     width=1, style=line.style_dashed, extend=extend.none)
@@ -659,7 +659,7 @@ if i_show_pivots and (barstate.isfirst or new_period)
     ln_s4 := line.new(left_x, lvl_s4, right_x, lvl_s4, color=c_pvt_s_dim, width=1, style=line.style_dotted, extend=extend.none)
 
 if i_show_pivots and not na(ln_pp)
-    int right_x = bar_index + 12
+    right_x = bar_index + 12
     line.set_x2(ln_pp, right_x)
     line.set_x2(ln_r1, right_x)
     line.set_x2(ln_r2, right_x)
