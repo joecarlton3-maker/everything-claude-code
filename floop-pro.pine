@@ -1,0 +1,658 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheRealDrip2Rip
+//
+// © FLOOP Pro — Finally Long Or Obviously Panicking
+// Decision-support edition: the chart stays clean (EMAs + prev day/month
+// high-low levels only). All signal intelligence lives on the dashboard —
+// you make the trading call yourself.
+
+//@version=5
+indicator("FLOOP Pro", shorttitle="FLOOP", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ▌ INPUTS ─────────────────────────────────────────────────────────────────
+grp_lvl = "── Key Levels ──"
+i_show_pd       = input.bool(true, "Show Prev Day High/Low (PDH/PDL)",     group=grp_lvl)
+i_show_pm       = input.bool(true, "Show Prev Month High/Low (PMH/PML)",   group=grp_lvl)
+i_lvl_labels    = input.bool(true, "Show Level Labels",                    group=grp_lvl)
+i_lvl_extend_left = input.int(100, "Extend Lines Left (bars)", minval=0, group=grp_lvl, tooltip="How many bars back from the period rollover the lines will draw (0 = only from the current bar)")
+
+grp_core = "── Core ──"
+i_sensitivity = input.int(6,     "Sensitivity",    minval=1, maxval=30, group=grp_core, tooltip="Baseline: 8. ML found S:12 and S:16 are the most predictive cross-checks.")
+i_atr_len     = input.int(14,    "ATR Length",     minval=1, maxval=50, group=grp_core)
+i_atr_mult    = input.float(0.8, "ATR Multiplier", minval=0.1, step=0.1, group=grp_core)
+
+grp_htf = "── Higher Timeframe ──"
+i_htf        = input.timeframe("30", "HTF Timeframe", group=grp_htf)
+i_htf_ma_len = input.int(90, "HTF MA Length", minval=5, group=grp_htf)
+
+grp_ema = "── EMA Overlay ──"
+i_show_ema = input.bool(true, "Show EMA Lines", group=grp_ema)
+i_ema_fast = input.int(60,  "Fast EMA", minval=2,  group=grp_ema)
+i_ema_slow = input.int(200, "Slow EMA", minval=5, group=grp_ema)
+
+grp_chop = "── Anti-Chop Filters ──"
+i_use_adx      = input.bool(true,   "Enable ADX Filter", group=grp_chop, tooltip="ADX measures trend strength. Low ADX = sideways chop.")
+i_adx_len      = input.int(14,      "ADX Length", minval=5,  maxval=50,  group=grp_chop)
+i_adx_thresh   = input.float(20.0,  "ADX Threshold",    minval=10, maxval=40, step=1.0, group=grp_chop, tooltip="20 = moderate, 25 = strict.")
+i_use_chop     = input.bool(true,  "Enable Choppiness Index Filter", group=grp_chop, tooltip="High CI = range-bound. Different lens than ADX.")
+i_chop_len     = input.int(14,      "Choppiness Length", minval=5,  maxval=50,  group=grp_chop)
+i_chop_thresh  = input.float(61.8,  "Choppiness Max",   minval=40, maxval=80, step=0.5, group=grp_chop, tooltip="61.8 = standard, lower = stricter.")
+i_use_cooldown = input.bool(true,   "Enable Signal Cooldown", group=grp_chop, tooltip="Min bars between signals to prevent whipsaw.")
+i_cooldown_len = input.int(5,       "Cooldown Bars",    minval=1,  maxval=50,  group=grp_chop)
+
+grp_sig = "── Signals ──"
+i_ema_filter = input.bool(true, "Only fire signals when EMA aligned (ML-recommended)", group=grp_sig, tooltip="EMA alignment lifts win rate by ~27pts.")
+
+grp_dash = "── Dashboard ──"
+i_show_dash = input.bool(true,      "Show Dashboard",                         group=grp_dash)
+i_dash_x    = input.string("Right", "Dashboard Position", options=["Left","Right"], group=grp_dash)
+i_show_btm  = input.bool(true,      "Show Bottom Strip (MTF + Sensitivity)", group=grp_dash)
+
+grp_theme = "── Theme ──"
+i_theme = input.string("Dark", "Chart Background", options=["Dark","Light"], group=grp_theme, tooltip="Choose the theme that matches your chart background color.")
+
+// ▌ THEME ENGINE ───────────────────────────────────────────────────────────
+is_dark = i_theme == "Dark"
+
+c_bull       = is_dark ? color.new(#00d4a0, 0)  : color.new(#0ea371, 0)
+c_bear       = is_dark ? color.new(#ff4d6d, 0)  : color.new(#d93025, 0)
+c_ema_fast   = is_dark ? color.new(#58a6ff, 50) : color.new(#1a73e8, 40)
+c_ema_slow   = is_dark ? color.new(#f0883e, 60) : color.new(#c45d18, 50)
+
+DASH_BG1    = is_dark ? color.new(#0d1117, 0) : color.new(#ffffff, 0)
+DASH_BG2    = is_dark ? color.new(#131920, 0) : color.new(#f6f8fa, 0)
+DASH_BDR    = is_dark ? color.new(#1e2832, 0) : color.new(#d1d9e0, 0)
+DASH_TEXT   = is_dark ? color.new(#c8d6e0, 0) : color.new(#1f2328, 0)
+DASH_DIM    = is_dark ? color.new(#4a6278, 0) : color.new(#656d76, 0)
+DASH_BLUE   = is_dark ? color.new(#58a6ff, 0) : color.new(#0969da, 0)
+DASH_GOLD   = is_dark ? color.new(#e3b341, 0) : color.new(#9a6700, 0)
+DASH_ORANGE = is_dark ? color.new(#f0883e, 0) : color.new(#bc4c00, 0)
+BLACK       = color.new(color.black, 0)
+WHITE       = color.new(color.white, 0)
+
+// ▌ CORE RANGE FILTER ─────────────────────────────────────────────────────
+f_range_filter(src, sens, atr_len, atr_mult) =>
+    atr   = ta.atr(atr_len)
+    rng   = atr * atr_mult * (sens / 8.0)
+    var float filt  = src
+    var int   trend = 0
+    filt  := src > filt + rng ? src - rng : src < filt - rng ? src + rng : filt
+    prev   = trend[1]
+    trend := filt > filt[1] ? 1 : filt < filt[1] ? -1 : trend[1]
+    sig    = trend != prev ? trend : 0
+    [filt, trend, sig]
+
+[rf_filt, rf_trend, rf_sig] = f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult)
+
+// ▌ ATR & VOLATILITY ──────────────────────────────────────────────────────
+atr_val  = ta.atr(i_atr_len)
+atr_norm = atr_val / close * 100
+
+atr_rank = 0.0
+for k = 0 to 59
+    if atr_val >= atr_val[k]
+        atr_rank += 1
+atr_rank := math.round(atr_rank / 60 * 100)
+
+vol_label = atr_rank > 75 ? "HIGH" : atr_rank > 45 ? "MED" : "LOW"
+vol_col   = atr_rank > 75 ? c_bear : atr_rank > 45 ? DASH_GOLD : c_bull
+score_vol = (atr_rank < 80 ? 1 : 0) + (atr_norm < ta.percentile_nearest_rank(atr_norm, 60, 65) ? 1 : 0)
+
+// ▌ MOMENTUM ──────────────────────────────────────────────────────────────
+roc5  = (close - close[5])  / close[5]  * 100
+roc10 = (close - close[10]) / close[10] * 100
+roc20 = (close - close[20]) / close[20] * 100
+
+mom_bull    = roc5 > 0 and roc10 > 0 and roc20 > 0
+mom_bear    = roc5 < 0 and roc10 < 0 and roc20 < 0
+mom_aligned = (rf_trend == 1 and mom_bull) or (rf_trend == -1 and mom_bear)
+mom_partial = (rf_trend == 1 and roc5 > 0) or (rf_trend == -1 and roc5 < 0)
+
+// ▌ ANTI-CHOP: ADX ────────────────────────────────────────────────────────
+f_adx(len) =>
+    up   = high - high[1]
+    down = low[1] - low
+    plus_dm  = up > down and up > 0 ? up : 0.0
+    minus_dm = down > up and down > 0 ? down : 0.0
+    true_range = ta.atr(1)
+    plus_di  = 100 * ta.rma(plus_dm,  len) / ta.rma(true_range, len)
+    minus_di = 100 * ta.rma(minus_dm, len) / ta.rma(true_range, len)
+    dx       = math.abs(plus_di - minus_di) / (plus_di + minus_di) * 100
+    adx_val  = ta.rma(dx, len)
+    [adx_val, plus_di, minus_di]
+
+[adx_value, di_plus, di_minus] = f_adx(i_adx_len)
+adx_trending = adx_value >= i_adx_thresh
+
+// ▌ ANTI-CHOP: Choppiness Index ───────────────────────────────────────────
+chop_atr_sum = math.sum(ta.atr(1), i_chop_len)
+chop_hi      = ta.highest(high, i_chop_len)
+chop_lo      = ta.lowest(low, i_chop_len)
+chop_range   = chop_hi - chop_lo
+chop_index   = chop_range > 0 ? 100 * math.log10(chop_atr_sum / chop_range) / math.log10(i_chop_len) : 50.0
+chop_clear   = chop_index <= i_chop_thresh
+
+// ▌ ANTI-CHOP: Signal Cooldown ────────────────────────────────────────────
+var int bars_since_signal = 999
+bars_since_signal := bars_since_signal + 1
+cooldown_clear = not i_use_cooldown or bars_since_signal >= i_cooldown_len
+
+// ▌ ANTI-CHOP: Combined Gate ──────────────────────────────────────────────
+chop_gate    = (not i_use_adx or adx_trending) and (not i_use_chop or chop_clear) and cooldown_clear
+chop_penalty = (i_use_adx and not adx_trending ? -1 : 0) + (i_use_chop and not chop_clear ? -1 : 0)
+
+// ▌ EMA OVERLAY + ALIGNMENT ───────────────────────────────────────────────
+ema_fast = ta.ema(close, i_ema_fast)
+ema_slow = ta.ema(close, i_ema_slow)
+
+ema_cross_bull  = ema_fast > ema_slow
+ema_price_above = close > ema_fast
+ema_slope_up    = ema_fast > ema_fast[5]
+ema_all_bull    = ema_cross_bull and ema_price_above and ema_slope_up
+
+ema_cross_bear  = ema_fast < ema_slow
+ema_price_below = close < ema_fast
+ema_slope_down  = ema_fast < ema_fast[5]
+ema_all_bear    = ema_cross_bear and ema_price_below and ema_slope_down
+
+ema_cond1 = rf_trend == 1 ? ema_cross_bull  : ema_cross_bear
+ema_cond2 = rf_trend == 1 ? ema_price_above : ema_price_below
+score_ema = math.min((ema_cond1 ? 1 : 0) + (ema_cond2 ? 1 : 0) + (mom_aligned ? 1 : 0) + (mom_partial ? 1 : 0), 4)
+
+ema_fully_aligned = rf_trend == 1 ? ema_all_bull : ema_all_bear
+
+// ▌ CHART PLOTS (EMAs only — the chart stays clean) ───────────────────────
+plot(i_show_ema ? ema_fast : na, "EMA Fast", color=c_ema_fast, linewidth=1)
+plot(i_show_ema ? ema_slow : na, "EMA Slow", color=c_ema_slow, linewidth=1)
+
+// ▌ SIGNAL GATING ─────────────────────────────────────────────────────────
+long_sig_raw  = rf_sig == 1
+short_sig_raw = rf_sig == -1
+ema_gate      = i_ema_filter ? ema_fully_aligned : true
+long_sig      = long_sig_raw  and ema_gate and chop_gate
+short_sig     = short_sig_raw and ema_gate and chop_gate
+
+if long_sig or short_sig
+    bars_since_signal := 0
+
+chop_filtered_long  = long_sig_raw  and (not chop_gate or (i_ema_filter and not ema_gate))
+chop_filtered_short = short_sig_raw and (not chop_gate or (i_ema_filter and not ema_gate))
+
+// ── Last-signal memory (for the dashboard) ──
+var int   last_sig_dir   = 0
+var int   last_sig_bar   = na
+var float last_sig_price = na
+if long_sig
+    last_sig_dir   := 1
+    last_sig_bar   := bar_index
+    last_sig_price := close
+if short_sig
+    last_sig_dir   := -1
+    last_sig_bar   := bar_index
+    last_sig_price := close
+
+// ── Trend age: bars since the range filter last flipped ──
+rf_flip    = ta.change(rf_trend) != 0
+trend_bars = ta.barssince(rf_flip)
+
+// ▌ HTF BIAS ──────────────────────────────────────────────────────────────
+[_, htf_trend, _] = request.security(syminfo.tickerid, i_htf, f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+htf_bull  = htf_trend == 1
+htf_label = htf_bull ? "BULL" : "BEAR"
+htf_col   = htf_bull ? c_bull : c_bear
+sig_dir   = rf_trend
+score_htf = (sig_dir == 1 and htf_bull) or (sig_dir == -1 and not htf_bull) ? 1 : 0
+
+// ▌ MTF BIAS ──────────────────────────────────────────────────────────────
+[_, mtf1_trend,  _] = request.security(syminfo.tickerid, "1",   f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf5_trend,  _] = request.security(syminfo.tickerid, "5",   f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf15_trend, _] = request.security(syminfo.tickerid, "15",  f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf60_trend, _] = request.security(syminfo.tickerid, "60",  f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+[_, mtf240_trend,_] = request.security(syminfo.tickerid, "240", f_range_filter(close, i_sensitivity, i_atr_len, i_atr_mult), lookahead=barmerge.lookahead_off)
+
+score_mtf = (mtf5_trend==sig_dir?1:0) + (mtf15_trend==sig_dir?1:0) + (mtf60_trend==sig_dir?1:0) + (mtf240_trend==sig_dir?1:0)
+mtf_bulls = (mtf1_trend==1?1:0) + (mtf5_trend==1?1:0) + (mtf15_trend==1?1:0) + (mtf60_trend==1?1:0) + (mtf240_trend==1?1:0)
+
+// ▌ SENSITIVITY CROSS-CHECK ───────────────────────────────────────────────
+[_, sA_trend, _] = f_range_filter(close, 3,  i_atr_len, i_atr_mult)
+[_, sB_trend, _] = f_range_filter(close, 5,  i_atr_len, i_atr_mult)
+[_, sC_trend, _] = f_range_filter(close, 12, i_atr_len, i_atr_mult)
+[_, sD_trend, _] = f_range_filter(close, 16, i_atr_len, i_atr_mult)
+
+score_sens = (sC_trend==sig_dir ? 2 : 0) + (sD_trend==sig_dir ? 1 : 0)
+
+// ▌ SIGNAL STRENGTH (0–14) ────────────────────────────────────────────────
+signal_strength_raw = score_htf + score_mtf + score_sens + score_ema + score_vol
+signal_strength     = math.max(0, math.min(signal_strength_raw + chop_penalty, 14))
+
+str_label = signal_strength >= 11 ? "HIGH" : signal_strength >= 8 ? "MED" : signal_strength >= 6 ? "LOW" : "WEAK"
+str_col   = signal_strength >= 11 ? c_bull : signal_strength >= 8 ? DASH_GOLD : c_bear
+
+f_bar(n, max) =>
+    out = ""
+    for i = 0 to max - 1
+        out += i < n ? "█" : "░"
+    out
+
+// Signed-percent formatter for dashboard readouts
+f_pct_s(v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.#")
+
+// Level-distance cell text; flags levels within `near` percent of price
+f_lvl_txt(d, near) => (d >= 0 ? "+" : "") + str.tostring(d, "#.##") + "%" + (math.abs(d) <= near ? "  ◄ NEAR" : "") + "  "
+
+// ▌ ALERTS ─────────────────────────────────────────────────────────────────
+alertcondition(long_sig,                            "FLOOP Long",               "FLOOP: Long signal")
+alertcondition(short_sig,                           "FLOOP Short",              "FLOOP: Short signal")
+alertcondition(long_sig  and signal_strength >= 11, "FLOOP HQ Long",            "FLOOP: HIGH QUALITY Long — 11+/14")
+alertcondition(short_sig and signal_strength >= 11, "FLOOP HQ Short",           "FLOOP: HIGH QUALITY Short — 11+/14")
+alertcondition(long_sig  and ema_fully_aligned,     "FLOOP EMA-Confirmed Long", "FLOOP: Long + full EMA alignment")
+alertcondition(short_sig and ema_fully_aligned,     "FLOOP EMA-Confirmed Short","FLOOP: Short + full EMA alignment")
+
+// ▌ KEY LEVELS — PDH / PDL / PMH / PML ────────────────────────────────────
+// Previous Day High/Low and Previous Month High/Low, drawn as horizontal
+// lines with right-edge labels. Levels roll over when a new period starts.
+
+[pd_h, pd_l] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pm_h, pm_l] = request.security(syminfo.tickerid, "M", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+new_day   = ta.change(time("D")) != 0
+new_month = ta.change(time("M")) != 0
+
+// Signed distance from price to each level, in % (positive = level above price)
+dist_pdh = (pd_h - close) / close * 100
+dist_pdl = (pd_l - close) / close * 100
+dist_pmh = (pm_h - close) / close * 100
+dist_pml = (pm_l - close) / close * 100
+
+c_pdh = c_bear
+c_pdl = c_bull
+c_pmh = DASH_ORANGE
+c_pml = DASH_BLUE
+
+var int day_start_bar   = na
+var int month_start_bar = na
+if new_day
+    day_start_bar := bar_index
+if new_month
+    month_start_bar := bar_index
+
+var float lvl_pdh = na
+var float lvl_pdl = na
+var float lvl_pmh = na
+var float lvl_pml = na
+
+var line ln_pdh = na
+var line ln_pdl = na
+var line ln_pmh = na
+var line ln_pml = na
+
+var label lb_pdh = na
+var label lb_pdl = na
+var label lb_pmh = na
+var label lb_pml = na
+
+// ── Daily levels: redraw on each new day ──
+if i_show_pd and (barstate.isfirst or new_day)
+    lvl_pdh := pd_h
+    lvl_pdl := pd_l
+
+    line.delete(ln_pdh)
+    line.delete(ln_pdl)
+
+    d_left  = math.max(0, nz(day_start_bar, bar_index) - i_lvl_extend_left)
+    d_right = bar_index + 12
+
+    ln_pdh := line.new(d_left, lvl_pdh, d_right, lvl_pdh, color=c_pdh, width=1, style=line.style_solid, extend=extend.none)
+    ln_pdl := line.new(d_left, lvl_pdl, d_right, lvl_pdl, color=c_pdl, width=1, style=line.style_solid, extend=extend.none)
+
+// ── Monthly levels: redraw on each new month ──
+if i_show_pm and (barstate.isfirst or new_month)
+    lvl_pmh := pm_h
+    lvl_pml := pm_l
+
+    line.delete(ln_pmh)
+    line.delete(ln_pml)
+
+    m_left  = math.max(0, nz(month_start_bar, bar_index) - i_lvl_extend_left)
+    m_right = bar_index + 12
+
+    ln_pmh := line.new(m_left, lvl_pmh, m_right, lvl_pmh, color=c_pmh, width=1, style=line.style_dashed, extend=extend.none)
+    ln_pml := line.new(m_left, lvl_pml, m_right, lvl_pml, color=c_pml, width=1, style=line.style_dashed, extend=extend.none)
+
+// ── Grow the right edge toward the labels every bar ──
+if i_show_pd and not na(ln_pdh)
+    line.set_x2(ln_pdh, bar_index + 12)
+    line.set_x2(ln_pdl, bar_index + 12)
+
+if i_show_pm and not na(ln_pmh)
+    line.set_x2(ln_pmh, bar_index + 12)
+    line.set_x2(ln_pml, bar_index + 12)
+
+// ── Labels: create once, then pin to the right edge ──
+if i_show_pd and i_lvl_labels and (barstate.isfirst or new_day or na(lb_pdh))
+    label.delete(lb_pdh)
+    label.delete(lb_pdl)
+    lb_pdh := label.new(bar_index + 14, lvl_pdh, "PDH  " + str.tostring(lvl_pdh, format.mintick), style=label.style_label_left, color=color.new(c_pdh, 5), textcolor=color.white, size=size.small, textalign=text.align_left)
+    lb_pdl := label.new(bar_index + 14, lvl_pdl, "PDL  " + str.tostring(lvl_pdl, format.mintick), style=label.style_label_left, color=color.new(c_pdl, 5), textcolor=is_dark ? color.black : color.white, size=size.small, textalign=text.align_left)
+
+if i_show_pm and i_lvl_labels and (barstate.isfirst or new_month or na(lb_pmh))
+    label.delete(lb_pmh)
+    label.delete(lb_pml)
+    lb_pmh := label.new(bar_index + 14, lvl_pmh, "PMH  " + str.tostring(lvl_pmh, format.mintick), style=label.style_label_left, color=color.new(c_pmh, 5), textcolor=color.white, size=size.small, textalign=text.align_left)
+    lb_pml := label.new(bar_index + 14, lvl_pml, "PML  " + str.tostring(lvl_pml, format.mintick), style=label.style_label_left, color=color.new(c_pml, 5), textcolor=color.white, size=size.small, textalign=text.align_left)
+
+if i_show_pd and i_lvl_labels and not na(lb_pdh)
+    label.set_x(lb_pdh, bar_index + 14)
+    label.set_y(lb_pdh, lvl_pdh)
+    label.set_text(lb_pdh, "PDH  " + str.tostring(lvl_pdh, format.mintick))
+    label.set_x(lb_pdl, bar_index + 14)
+    label.set_y(lb_pdl, lvl_pdl)
+    label.set_text(lb_pdl, "PDL  " + str.tostring(lvl_pdl, format.mintick))
+
+if i_show_pm and i_lvl_labels and not na(lb_pmh)
+    label.set_x(lb_pmh, bar_index + 14)
+    label.set_y(lb_pmh, lvl_pmh)
+    label.set_text(lb_pmh, "PMH  " + str.tostring(lvl_pmh, format.mintick))
+    label.set_x(lb_pml, bar_index + 14)
+    label.set_y(lb_pml, lvl_pml)
+    label.set_text(lb_pml, "PML  " + str.tostring(lvl_pml, format.mintick))
+
+// ── Cleanup when toggled off ──
+if not i_show_pd
+    line.delete(ln_pdh)
+    line.delete(ln_pdl)
+    label.delete(lb_pdh)
+    label.delete(lb_pdl)
+    ln_pdh := na
+    ln_pdl := na
+    lb_pdh := na
+    lb_pdl := na
+    lvl_pdh := na
+    lvl_pdl := na
+
+if not i_show_pm
+    line.delete(ln_pmh)
+    line.delete(ln_pml)
+    label.delete(lb_pmh)
+    label.delete(lb_pml)
+    ln_pmh := na
+    ln_pml := na
+    lb_pmh := na
+    lb_pml := na
+    lvl_pmh := na
+    lvl_pml := na
+
+if i_show_pd and not i_lvl_labels
+    label.delete(lb_pdh)
+    label.delete(lb_pdl)
+    lb_pdh := na
+    lb_pdl := na
+
+if i_show_pm and not i_lvl_labels
+    label.delete(lb_pmh)
+    label.delete(lb_pml)
+    lb_pmh := na
+    lb_pml := na
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ▌ DASHBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var table dash = na
+
+f_dot(cond) => cond ? "●" : "○"
+
+if barstate.islast and i_show_dash
+    dash := table.new(
+      i_dash_x == "Right" ? position.top_right : position.top_left,
+      2, 45,
+      border_color=DASH_BDR, border_width=1,
+      frame_color=color.new(DASH_BLUE, 40), frame_width=1)
+
+    r = 0
+
+    // ── Header ──
+    table.cell(dash, 0, r, "  FLOOP PRO", text_color=DASH_BLUE, bgcolor=DASH_BG1, text_size=size.normal, text_halign=text.align_left)
+    table.cell(dash, 1, r, "v5  ", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    rf_lbl = (rf_trend == 1 ? "  BULLISH" : "  BEARISH") + " · " + str.tostring(trend_bars) + " bars"
+    rf_c   = rf_trend == 1 ? c_bull : c_bear
+    table.cell(dash, 0, r, rf_lbl, text_color=rf_c, bgcolor=DASH_BG2, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, "HTF " + htf_label + "  ", text_color=htf_col, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Signal Status (live opportunity read) ──
+    sig_now_txt = long_sig ? "▲ LONG ACTIVE  " :
+      short_sig ? "▼ SHORT ACTIVE  " :
+      chop_filtered_long  ? "△ LONG (gated)  " :
+      chop_filtered_short ? "▽ SHORT (gated)  " :
+      "—  "
+    sig_now_col = long_sig ? c_bull :
+      short_sig ? c_bear :
+      chop_filtered_long or chop_filtered_short ? DASH_GOLD :
+      DASH_DIM
+
+    table.cell(dash, 0, r, "  SIGNAL", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, sig_now_txt, text_color=sig_now_col, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    last_txt = last_sig_dir == 0 ? "none yet  " :
+      (last_sig_dir == 1 ? "LONG" : "SHORT") + " · " + str.tostring(bar_index - last_sig_bar) + " bars ago  "
+    last_col = last_sig_dir == 1 ? c_bull : last_sig_dir == -1 ? c_bear : DASH_DIM
+    table.cell(dash, 0, r, "  LAST SIGNAL", text_color=DASH_DIM, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, last_txt, text_color=last_col, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    // Move since the last signal fired — instant read on whether it worked
+    if last_sig_dir != 0 and not na(last_sig_price)
+        sig_move    = (close - last_sig_price) / last_sig_price * 100
+        sig_pl      = last_sig_dir == 1 ? sig_move : -sig_move
+        sig_pl_col  = sig_pl > 0 ? c_bull : sig_pl < 0 ? c_bear : DASH_DIM
+        table.cell(dash, 0, r, "  From " + str.tostring(last_sig_price, format.mintick), text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, r, (sig_pl >= 0 ? "+" : "") + str.tostring(sig_pl, "#.##") + "% in favor  ", text_color=sig_pl_col, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+        r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Signal Quality ──
+    table.cell(dash, 0, r, "  QUALITY", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, str_label + "  " + str.tostring(signal_strength) + "/14  ", text_color=str_col, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  " + f_bar(signal_strength, 14), text_color=str_col, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BG2)
+    r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Score Breakdown ──
+    table.cell(dash, 0, r, "  SCORING", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BG1)
+    r += 1
+
+    table.cell(dash, 0, r, "  EMA + Mom ★", text_color=DASH_GOLD, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, str.tostring(score_ema) + " / 4  ", text_color=score_ema >= 3 ? c_bull : score_ema >= 2 ? DASH_GOLD : DASH_DIM, bgcolor=DASH_BG2, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  MTF Confluence", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, str.tostring(score_mtf) + " / 4  ", text_color=score_mtf >= 3 ? c_bull : score_mtf >= 2 ? DASH_GOLD : DASH_DIM, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  Sensitivity", text_color=DASH_DIM, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, str.tostring(score_sens) + " / 3  ", text_color=score_sens >= 2 ? c_bull : score_sens >= 1 ? DASH_GOLD : DASH_DIM, bgcolor=DASH_BG2, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  Volatility", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, str.tostring(score_vol) + " / 2  ", text_color=score_vol >= 2 ? c_bull : score_vol >= 1 ? DASH_GOLD : DASH_DIM, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  HTF Bias", text_color=DASH_DIM, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, str.tostring(score_htf) + " / 1  ", text_color=score_htf == 1 ? c_bull : DASH_DIM, bgcolor=DASH_BG2, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    if chop_penalty != 0
+        table.cell(dash, 0, r, "  Chop Penalty", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, r, str.tostring(chop_penalty) + "  ", text_color=c_bear, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+        r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── EMA Structure ──
+    table.cell(dash, 0, r, "  EMA ALIGNMENT", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    ema_ec = ema_fully_aligned ? c_bull : c_bear
+    table.cell(dash, 1, r, ema_fully_aligned ? "✓ ALIGNED  " : "✗ NOT ALIGNED  ", text_color=ema_ec, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    ema_slope_ok = rf_trend == 1 ? ema_slope_up : ema_slope_down
+    table.cell(dash, 0, r, "  " + f_dot(ema_cond1) + " Cross  " + f_dot(ema_cond2) + " Price  " + f_dot(ema_slope_ok) + " Slope", text_color=DASH_DIM, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BG2)
+    r += 1
+
+    dist_fast = (close - ema_fast) / ema_fast * 100
+    dist_slow = (close - ema_slow) / ema_slow * 100
+    table.cell(dash, 0, r, "  vs Fast " + (dist_fast >= 0 ? "+" : "") + str.tostring(dist_fast, "#.##") + "%", text_color=dist_fast >= 0 ? c_bull : c_bear, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "vs Slow " + (dist_slow >= 0 ? "+" : "") + str.tostring(dist_slow, "#.##") + "%  ", text_color=dist_slow >= 0 ? c_bull : c_bear, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    // ── Momentum ──
+    mom_txt = mom_bull ? "BULL 3/3  " : mom_bear ? "BEAR 3/3  " : "MIXED  "
+    mom_col = mom_bull ? c_bull : mom_bear ? c_bear : DASH_GOLD
+    table.cell(dash, 0, r, "  MOMENTUM", text_color=DASH_DIM, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, mom_txt, text_color=mom_col, bgcolor=DASH_BG2, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  ROC 5/10/20", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, f_pct_s(roc5) + " / " + f_pct_s(roc10) + " / " + f_pct_s(roc20) + "%  ", text_color=mom_col, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Anti-Chop Status ──
+    table.cell(dash, 0, r, "  CHOP GATE", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, chop_gate ? "✓ OPEN  " : "✗ BLOCKED  ", text_color=chop_gate ? c_bull : c_bear, bgcolor=DASH_BG1, text_size=size.small, text_halign=text.align_right)
+    r += 1
+
+    di_txt   = di_plus > di_minus ? "+DI leads" : "−DI leads"
+    di_col   = di_plus > di_minus ? c_bull : c_bear
+    adx_str  = i_use_adx  ? (adx_trending ? "✓ " : "✗ ") + str.tostring(adx_value,"#.#") : "off"
+    table.cell(dash, 0, r, "  ADX " + adx_str, text_color=i_use_adx and not adx_trending ? c_bear : DASH_DIM, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, di_txt + "  ", text_color=di_col, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    chop_str = i_use_chop ? (chop_clear ? "✓ " : "✗ ") + str.tostring(chop_index,"#.#") + " / " + str.tostring(i_chop_thresh, "#.#") : "off"
+    cd_str   = i_use_cooldown ? (cooldown_clear ? "✓ ready" : str.tostring(i_cooldown_len - bars_since_signal) + " bars left") : "off"
+    table.cell(dash, 0, r, "  CI " + chop_str, text_color=i_use_chop and not chop_clear ? c_bear : DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "CD " + cd_str + "  ", text_color=i_use_cooldown and not cooldown_clear ? DASH_GOLD : DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Volatility ──
+    table.cell(dash, 0, r, "  Vol " + vol_label + " (" + str.tostring(atr_rank) + "%ile)", text_color=vol_col, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "ATR " + str.tostring(atr_norm, "#.##") + "%  ", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Key Levels: live distances (near = within half an ATR) ──
+    table.cell(dash, 0, r, "  KEY LEVELS", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "distance  ", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    near_band = atr_norm * 0.5
+
+    table.cell(dash, 0, r, "  PDH " + str.tostring(pd_h, format.mintick), text_color=c_pdh, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, f_lvl_txt(dist_pdh, near_band), text_color=math.abs(dist_pdh) <= near_band ? DASH_GOLD : DASH_TEXT, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  PDL " + str.tostring(pd_l, format.mintick), text_color=c_pdl, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, f_lvl_txt(dist_pdl, near_band), text_color=math.abs(dist_pdl) <= near_band ? DASH_GOLD : DASH_TEXT, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  PMH " + str.tostring(pm_h, format.mintick), text_color=c_pmh, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, f_lvl_txt(dist_pmh, near_band), text_color=math.abs(dist_pmh) <= near_band ? DASH_GOLD : DASH_TEXT, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "  PML " + str.tostring(pm_l, format.mintick), text_color=c_pml, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, f_lvl_txt(dist_pml, near_band), text_color=math.abs(dist_pml) <= near_band ? DASH_GOLD : DASH_TEXT, bgcolor=DASH_BG1, text_size=size.tiny, text_halign=text.align_right)
+    r += 1
+
+    table.cell(dash, 0, r, "", bgcolor=DASH_BDR)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BDR)
+    r += 1
+
+    // ── Verdict ──
+    tip = long_sig or short_sig ? "◆ Signal firing — assess entry now" :
+          chop_filtered_long or chop_filtered_short ? "◇ Raw flip gated — watch closely" :
+          signal_strength >= 11 ? "✓ High conviction backdrop" :
+          signal_strength >= 8  ? "◈ Moderate — check EMA alignment" :
+          signal_strength >= 6  ? "⚠ Low confluence — risky" :
+                                  "✗ Weak backdrop — sit tight"
+    table.cell(dash, 0, r, "  " + tip, text_color=long_sig or short_sig ? sig_now_col : str_col, bgcolor=DASH_BG2, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, r, "", bgcolor=DASH_BG2)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ▌ UNIFIED BOTTOM STRIP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var table btm = na
+
+if barstate.islast and i_show_btm
+    btm := table.new(
+      position.bottom_center, 13, 3,
+      border_color=DASH_BDR, border_width=1,
+      frame_color=color.new(DASH_BLUE, 60), frame_width=1)
+
+    // Row 0 — Headers
+    table.cell(btm, 0, 0, " MTF ", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny)
+    mtf_names = array.from("1m*", "5m", "15m", "1h", "4h")
+    for i = 0 to 4
+        nc = i == 0 ? color.new(DASH_DIM, 40) : DASH_DIM
+        table.cell(btm, i + 1, 0, array.get(mtf_names, i), text_color=nc, bgcolor=DASH_BG1, text_size=size.tiny)
+
+    table.cell(btm, 6, 0, "", bgcolor=DASH_BDR)
+
+    table.cell(btm, 7, 0, " SENS ", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny)
+    s_labels = array.from("3*", "5*", str.tostring(i_sensitivity) + "★", "12", "16")
+    for i = 0 to 4
+        sc = i < 2 ? color.new(DASH_DIM, 40) : i == 2 ? DASH_BLUE : DASH_GOLD
+        table.cell(btm, i + 8, 0, array.get(s_labels, i), text_color=sc, bgcolor=DASH_BG1, text_size=size.tiny)
+
+    // Row 1 — Spacer
+    for i = 0 to 12
+        table.cell(btm, i, 1, "", bgcolor=i == 6 ? DASH_BDR : DASH_BG2)
+
+    // Row 2 — Values
+    mtf_trends = array.from(mtf1_trend, mtf5_trend, mtf15_trend, mtf60_trend, mtf240_trend)
+    s_trends   = array.from(sA_trend, sB_trend, rf_trend, sC_trend, sD_trend)
+
+    cell_tc = is_dark ? BLACK : WHITE
+
+    table.cell(btm, 0, 2, " RF ", text_color=DASH_DIM, bgcolor=DASH_BG1, text_size=size.tiny)
+    for i = 0 to 4
+        tr = array.get(mtf_trends, i)
+        tc = i == 0 ? color.new(cell_tc, 40) : cell_tc
+        table.cell(btm, i + 1, 2, tr == 1 ? "▲" : "▼", text_color=tc, bgcolor=tr == 1 ? c_bull : c_bear, text_size=size.tiny)
+
+    table.cell(btm, 6, 2, "", bgcolor=DASH_BDR)
+
+    table.cell(btm, 7, 2, str.tostring(score_mtf) + "/" + str.tostring(score_sens), text_color=str_col, bgcolor=DASH_BG1, text_size=size.tiny)
+    for i = 0 to 4
+        tr = array.get(s_trends, i)
+        tc = i < 2 ? color.new(cell_tc, 40) : cell_tc
+        table.cell(btm, i + 8, 2, tr == 1 ? "▲" : "▼", text_color=tc, bgcolor=tr == 1 ? c_bull : c_bear, text_size=size.tiny)
